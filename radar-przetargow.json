@@ -1,0 +1,2692 @@
+{
+  "name": "Radar Przetargów · Tender Radar PL/EN",
+  "nodes": [
+    {
+      "id": "8dddc9e3-1fd6-4fcc-92df-252fad250a2a",
+      "name": "Wyszukiwanie / Search (POST radar-search)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "radar-search",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*"
+        }
+      },
+      "webhookId": "586be4ff-6f98-4d28-a4b7-eb05199e9d9c",
+      "notes": "PL: Tu strona wysyła wpisaną frazę. Odpowiedź wraca jako lista wyników.\nEN: The page sends the typed phrase here. The answer comes back as a list of results."
+    },
+    {
+      "id": "bad2f880-1776-4ad8-b094-7d98b257d30f",
+      "name": "Sprawdź zapytanie / Validate input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// PL: Sprawdzamy frazę i limit wyszukiwań (ochrona kosztów AI) oraz zaglądamy do pamięci podręcznej.\n// EN: We check the phrase and the search limit (AI cost guard) and look into the cache.\nconst first = $input.first().json || {};\nconst body = first.body || first || {};\nconst raw = String(body.query || '').replace(/\\s+/g, ' ').trim();\nconst lang = body.lang === 'en' ? 'en' : 'pl';\nconst province = String(body.province || '').toLowerCase().trim();\nconst MSG = {\n  short: { pl: 'Wpisz co najmniej 2 znaki.', en: 'Please enter at least 2 characters.' },\n  long: { pl: 'Fraza jest za długa (maks. 160 znaków).', en: 'The phrase is too long (max 160 characters).' },\n  busy: { pl: 'Dużo osób szuka w tej chwili. Spróbuj za kilka minut.', en: 'Many people are searching right now. Please try again in a few minutes.' }\n};\nconst store = $getWorkflowStaticData('global');\nconst started_at = Date.now();\nconst key = (raw + '|' + province).toLowerCase();\nconst hit = store.cache && store.cache[key];\nif (raw.length >= 2 && raw.length <= 160 && hit && Date.now() - hit.t < 15 * 60 * 1000) {\n  return [{ json: { ok: true, cached: true, response: Object.assign({}, hit.data, { cached: true, lang, took_ms: 0 }), query: raw, lang, province, started_at } }];\n}\nconst hour = new Date().toISOString().slice(0, 13);\nif (store.hour !== hour) { store.hour = hour; store.count = 0; }\nconst LIMIT = 120; // PL: maks. wyszukiwań na godzinę / EN: max searches per hour\nlet ok = true;\nlet error = '';\nif (raw.length < 2) { ok = false; error = MSG.short[lang]; }\nelse if (raw.length > 160) { ok = false; error = MSG.long[lang]; }\nelse if (store.count >= LIMIT) { ok = false; error = MSG.busy[lang]; }\nelse { store.count = (store.count || 0) + 1; }\nreturn [{ json: { ok, cached: false, error, query: raw.slice(0, 160), lang, province, started_at } }];"
+      },
+      "notes": "PL: Pilnuje długości frazy i limitu wyszukiwań na godzinę, żeby nikt nie wygenerował wysokich kosztów AI.\nEN: Guards the phrase length and an hourly search limit so nobody can run up the AI bill."
+    },
+    {
+      "id": "4c9964d1-53f3-451e-b828-ea0451bce3f0",
+      "name": "Czy fraza jest poprawna? / Is the phrase valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        760,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.ok }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "rightValue": ""
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "notes": "PL: Poprawna fraza idzie dalej. Błędna dostaje krótką, uprzejmą odpowiedź.\nEN: A valid phrase goes on. An invalid one gets a short, polite reply."
+    },
+    {
+      "id": "9c1437b6-3333-4cbc-aa7a-1d6bef18c4f5",
+      "name": "Zrozum frazę (AI) / Understand the phrase (AI)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        1020,
+        120
+      ],
+      "parameters": {
+        "resource": "text",
+        "operation": "response",
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "gpt-4.1-mini"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You help people find public tenders in Poland (BZP and TED). The user types a short phrase in Polish or English. Reply with JSON only, using exactly these keys:\n\"stems\": array of 2 to 5 SHORT Polish word stems (lowercase letters only, 4 to 8 letters, no spaces) that would appear INSIDE the title of a matching Polish tender. Use the part of the word that does not change with grammatical case, for example \"sprząt\" for sprzątanie/sprzątania, \"dach\" for dachu/dachowy, \"komputer\", \"remont\". Include close synonyms. If the user wrote English, translate the idea to Polish first.\n\"keywords\": array of 2 to 4 FULL Polish words in base form (for example \"sprzątanie\", \"dach\", \"komputer\") used to search titles in the EU TED database.\n\"cpv\": array of 0 to 3 CPV code prefixes of 4 or 5 digits that best describe the subject, for example \"9091\" for cleaning services, \"4526\" for roofing works, \"3021\" for computers.\n\"order_type\": one of \"works\", \"services\", \"delivery\" or \"any\".\n\"province\": the Polish voivodeship name in lowercase only if the user clearly asks for a region (for example \"podkarpackie\"), otherwise an empty string.\n\"intent_pl\": one short Polish sentence saying what you understood.\n\"intent_en\": the same sentence in English.\nNever invent facts. If the phrase makes no sense, return empty arrays."
+            },
+            {
+              "role": "user",
+              "content": "={{ $json.query }}"
+            }
+          ]
+        },
+        "simplify": true,
+        "options": {
+          "textFormat": {
+            "textOptions": {
+              "type": "json_object"
+            }
+          },
+          "maxTokens": 450,
+          "temperature": 0.2
+        }
+      },
+      "notes": "PL: AI (twoje konto OpenAI) zamienia zwykłe słowa na fragmenty słów i kody branżowe, żeby nie przegapić ogłoszeń zapisanych inaczej.\nEN: AI (your OpenAI account) turns plain words into word stems and industry codes, so tenders worded differently are not missed.",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "id": "4c2fdd55-a11a-41d1-be31-4fa3dd8bbf47",
+      "name": "Przygotuj zapytania / Build source queries",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// PL: Z odpowiedzi AI budujemy zapytania do BZP i TED. Gdy AI zawiedzie, używamy prostego planu B.\n// EN: We build the BZP and TED requests from the AI answer. If AI fails, a simple plan B is used.\nconst input = $('Sprawdź zapytanie / Validate input').first().json;\nconst src = $input.first().json || {};\nfunction textOf(j) {\n  if (j && Array.isArray(j.output)) {\n    for (const o of j.output) for (const c of (o.content || [])) if (c && c.text) return c.text;\n  }\n  if (j && typeof j.output === 'string') return j.output;\n  if (j && j.text) return j.text;\n  return '';\n}\nfunction extractJson(j) {\n  const t = textOf(j);\n  if (t && typeof t === 'object') return t;\n  if (!t) return {};\n  const m = String(t).match(/\\{[\\s\\S]*\\}/);\n  if (!m) return {};\n  try { return JSON.parse(m[0]); } catch (e) { return {}; }\n}\nconst ai = extractJson(src);\nconst PROVINCES = { 'dolnośląskie': 'PL02', 'kujawsko-pomorskie': 'PL04', 'lubelskie': 'PL06', 'lubuskie': 'PL08', 'łódzkie': 'PL10', 'małopolskie': 'PL12', 'mazowieckie': 'PL14', 'opolskie': 'PL16', 'podkarpackie': 'PL18', 'podlaskie': 'PL20', 'pomorskie': 'PL22', 'śląskie': 'PL24', 'świętokrzyskie': 'PL26', 'warmińsko-mazurskie': 'PL28', 'wielkopolskie': 'PL30', 'zachodniopomorskie': 'PL32' };\nconst STOP = new Set(['dla', 'oraz', 'przy', 'the', 'and', 'for', 'with', 'from', 'tender', 'tenders', 'przetarg', 'przetargi', 'zamówienie', 'zamowienie']);\nconst words = input.query.toLowerCase().replace(/[^a-ząćęłńóśźż0-9\\s-]/g, ' ').split(/\\s+/).filter((w) => w.length > 2 && !STOP.has(w));\nconst clean = (arr, min, max) => [...new Set((Array.isArray(arr) ? arr : []).map((s) => String(s).toLowerCase().replace(/[^a-ząćęłńóśźż0-9]/g, '')).filter((s) => s.length >= min && s.length <= max))];\nlet stems = clean(ai.stems, 3, 9).slice(0, 5);\nconst usedFallback = stems.length === 0;\nif (usedFallback) stems = [...new Set(words.map((w) => w.replace(/[^a-ząćęłńóśźż0-9]/g, '').slice(0, Math.max(4, w.length - 2))))].filter((s) => s.length >= 3).slice(0, 4);\nlet keywords = clean(ai.keywords, 3, 20).slice(0, 4);\nif (keywords.length === 0) keywords = [...new Set(words.map((w) => w.replace(/[^a-ząćęłńóśźż0-9]/g, '')))].slice(0, 3);\nconst cpv = [...new Set((Array.isArray(ai.cpv) ? ai.cpv : []).map((c) => String(c).replace(/\\D/g, '').replace(/0+$/, '')).filter((c) => c.length >= 3).map((c) => c.slice(0, 5)))].slice(0, 3);\nconst typeMap = { works: 'Works', services: 'Services', delivery: 'Delivery' };\nconst orderType = typeMap[String(ai.order_type || '').toLowerCase()] || '';\nconst provName = String(input.province || ai.province || '').toLowerCase().trim();\nconst provCode = PROVINCES[provName] || '';\nconst now = new Date();\nconst iso = (d) => d.toISOString().slice(0, 19);\nconst from = iso(new Date(now.getTime() - 45 * 86400000));\nconst to = iso(new Date(now.getTime() + 86400000));\nconst open = iso(now);\nconst base = 'https://ezamowienia.gov.pl/mo-board/api/v1/Board/Search?noticeType=ContractNotice&publicationDateFrom=' + from + '&publicationDateTo=' + to + '&submittingOffersDateFrom=' + open + '&SortingColumnName=PublicationDate&SortingDirection=DESC&pageSize=10'\n  + (provCode ? '&organizationProvince=' + provCode : '') + (orderType ? '&orderType=' + orderType : '');\nconst ctx = { query: input.query, lang: input.lang, started_at: input.started_at, stems, keywords, cpv, words: words.map((w) => w.slice(0, 5)), province: provName, order_type: String(ai.order_type || 'any').toLowerCase(), intent_pl: String(ai.intent_pl || ''), intent_en: String(ai.intent_en || ''), used_fallback: usedFallback };\nconst out = [];\nfor (const s of stems) for (const page of [1, 2, 3]) out.push({ json: { kind: 'stem', term: s, page, url: base + '&orderObject=' + encodeURIComponent(s) + '&pageNumber=' + page, ctx } });\nfor (const c of cpv) for (const page of [1, 2]) out.push({ json: { kind: 'cpv', term: c, page, url: base + '&cpvCode=' + c + '&pageNumber=' + page, ctx } });\nconst d = new Date(now.getTime() - 60 * 86400000);\nconst pad = (n) => String(n).padStart(2, '0');\nconst tedFrom = String(d.getUTCFullYear()) + pad(d.getUTCMonth() + 1) + pad(d.getUTCDate());\nconst tedParts = [];\nfor (const c of cpv) tedParts.push('classification-cpv=' + c + '*');\nfor (const k of keywords) tedParts.push('notice-title ~ ' + k);\nconst tedQuery = 'buyer-country=POL AND form-type=competition AND publication-date>=' + tedFrom + (tedParts.length ? ' AND (' + tedParts.join(' OR ') + ')' : '') + ' SORT BY publication-number DESC';\nconst tedBody = JSON.stringify({ query: tedQuery, fields: ['publication-number', 'notice-title', 'buyer-name', 'buyer-city', 'publication-date', 'deadline-receipt-tender-date-lot', 'classification-cpv', 'contract-nature', 'estimated-value-lot'], page: 1, limit: 30, scope: 'ACTIVE', paginationMode: 'PAGE_NUMBER' });\nif (out.length) out[0].json.ted_body = tedBody;\nreturn out.length ? out : [{ json: { kind: 'none', url: base + '&pageNumber=1&orderObject=zzzzzz', ctx, ted_body: tedBody } }];"
+      },
+      "notes": "PL: Przygotowuje do 21 małych zapytań do BZP (po słowach i po kodach branżowych) oraz jedno do TED.\nEN: Prepares up to 21 small requests to BZP (by words and by industry codes) and one to TED."
+    },
+    {
+      "id": "6d1a2181-ff7b-45ad-b449-359ced072e43",
+      "name": "Pobierz z BZP / Fetch from BZP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1540,
+        0
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "RadarPrzetargow-Portfolio/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000,
+          "batching": {
+            "batch": {
+              "batchSize": 8,
+              "batchInterval": 0
+            }
+          }
+        }
+      },
+      "notes": "PL: Pyta oficjalne API e-Zamówień o otwarte przetargi pasujące do każdego słowa i kodu (8 zapytań naraz).\nEN: Asks the official e-Zamówienia API for open tenders matching each word and code (8 requests at a time).",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 800,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "4ed5a51c-fb6a-4364-9bf7-2fd3f586c76e",
+      "name": "Połącz źródła / Combine sources",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1800,
+        120
+      ],
+      "parameters": {
+        "mode": "append"
+      },
+      "notes": "PL: Łączy wyniki z obu źródeł w jedną listę.\nEN: Joins the results of both sources into one list."
+    },
+    {
+      "id": "c53083e4-1d0a-4cec-b384-55060ba3631f",
+      "name": "Odpowiedz błędem / Respond with error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1020,
+        480
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, error: $json.error } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "notes": "PL: Zwraca czytelny komunikat zamiast technicznego błędu.\nEN: Returns a readable message instead of a technical error."
+    },
+    {
+      "id": "bae2a9b4-3494-4711-9fed-f22be9295f36",
+      "name": "Pobierz z TED / Fetch from TED",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1540,
+        240
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.ted.europa.eu/v3/notices/search",
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "RadarPrzetargow-Portfolio/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "specifyBody": "json",
+        "jsonBody": "={{ $(\"Przygotuj zapytania / Build source queries\").first().json.ted_body }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "notes": "PL: Jedno zapytanie do europejskiego TED o przetargi z Polski pasujące do fraz.\nEN: One request to the European TED for Polish tenders matching the phrases.",
+      "executeOnce": true,
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 800,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "b0018a99-13a7-453b-9d71-986d9503253c",
+      "name": "Ujednolić i usuń duplikaty / Normalize & deduplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// PL: Ujednolicamy ogłoszenia z BZP i TED, odrzucamy zakończone i usuwamy duplikaty (te same ogłoszenia z obu źródeł).\n// EN: We unify BZP and TED notices, drop closed ones and remove duplicates (the same notice from both sources).\nconst ctx = $('Przygotuj zapytania / Build source queries').first().json.ctx;\nconst PROVINCES = { PL02: 'dolnośląskie', PL04: 'kujawsko-pomorskie', PL06: 'lubelskie', PL08: 'lubuskie', PL10: 'łódzkie', PL12: 'małopolskie', PL14: 'mazowieckie', PL16: 'opolskie', PL18: 'podkarpackie', PL20: 'podlaskie', PL22: 'pomorskie', PL24: 'śląskie', PL26: 'świętokrzyskie', PL28: 'warmińsko-mazurskie', PL30: 'wielkopolskie', PL32: 'zachodniopomorskie' };\nconst BZP_TYPES = { Delivery: 'delivery', Services: 'services', Works: 'works' };\nconst TED_TYPES = { supplies: 'delivery', services: 'services', works: 'works' };\nconst first = (v) => (Array.isArray(v) ? v[0] : v);\nconst pickText = (o) => { if (!o) return ''; if (typeof o === 'string') return o; const v = o.pol || o.eng || o.mul || Object.values(o)[0]; return String(first(v) || ''); };\nconst norm = (s) => String(s || '').toLowerCase().replace(/[^a-ząćęłńóśźż0-9]/g, '');\nconst now = Date.now();\nconst rows = [];\nfor (const it of $input.all()) {\n  const n = it.json || {};\n  if (n.bzpNumber) {\n    rows.push({ notice_id: n.bzpNumber, source: 'BZP', title: String(n.orderObject || '').replace(/\\s+/g, ' ').trim(), cpv: [...new Set(String(n.cpvCode || '').match(/\\d{8}/g) || [])].join(' '), buyer: String(n.organizationName || '').trim(), city: String(n.organizationCity || '').trim(), province: PROVINCES[n.organizationProvince] || '', order_type: BZP_TYPES[n.orderType] || '', published: n.publicationDate || null, deadline: n.submittingOffersDate || null, url: 'https://ezamowienia.gov.pl/mo-client-board/bzp/notice-details/id/' + n.objectId, object_id: n.objectId, below_eu: n.isTenderAmountBelowEU === true, est_value: null });\n  } else if (Array.isArray(n.notices)) {\n    for (const t of n.notices) {\n      const pub = t['publication-number'];\n      if (!pub) continue;\n      let title = pickText(t['notice-title']).replace(/\\s+/g, ' ').trim();\n      const parts = title.split(' – ');\n      if (parts.length >= 3) title = parts.slice(2).join(' – ');\n      const dl = String(first(t['deadline-receipt-tender-date-lot']) || '').slice(0, 10);\n      const pb = String(t['publication-date'] || '').slice(0, 10);\n      const val = Number(first(t['estimated-value-lot']));\n      rows.push({ notice_id: 'TED ' + pub, source: 'TED', title, cpv: [...new Set((t['classification-cpv'] || []).map((c) => String(c).slice(0, 8)))].join(' '), buyer: pickText(t['buyer-name']), city: pickText(t['buyer-city']), province: '', order_type: TED_TYPES[first(t['contract-nature'])] || '', published: pb ? pb + 'T00:00:00Z' : null, deadline: dl ? dl + 'T23:59:00+01:00' : null, url: 'https://ted.europa.eu/pl/notice/-/detail/' + pub, object_id: '', below_eu: false, est_value: Number.isFinite(val) && val > 0 ? val : null });\n    }\n  }\n}\nconst byId = new Map();\nfor (const r of rows) {\n  const dl = r.deadline ? Date.parse(r.deadline) : NaN;\n  if (!isNaN(dl) && dl < now) continue;\n  r.days_left = isNaN(dl) ? null : Math.max(0, Math.ceil((dl - now) / 86400000));\n  const key = norm(r.title).slice(0, 60) + '|' + norm(r.buyer).slice(0, 25);\n  const prev = byId.get(key);\n  if (!prev || (r.source === 'TED' && prev.source === 'BZP')) byId.set(key, r);\n}\nconst out = [...byId.values()].map((r) => ({ json: Object.assign({}, r, { q_stems: ctx.stems, q_cpv: ctx.cpv, q_words: ctx.words, q_province: ctx.province, q_type: ctx.order_type }) }));\nreturn out.length ? out : [{ json: { _none: true } }];"
+      },
+      "notes": "PL: Jedna czysta lista: te same pola dla BZP i TED, bez zakończonych i bez powtórzeń.\nEN: One clean list: the same fields for BZP and TED, no closed tenders and no repeats."
+    },
+    {
+      "id": "23333a3f-f0f6-4ae6-b073-361cd6f2fa9d",
+      "name": "Oceń trafność (Python) / Score relevance (Python)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2320,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "pythonNative",
+        "pythonCode": "# PL: Oceniamy, jak bardzo każdy przetarg pasuje do zapytania (0-100) i zapisujemy powody.\n# EN: We score how well each tender matches the query (0-100) and keep the reasons.\nscored = []\nfor item in _items:\n    t = dict(item['json'])\n    if t.get('_none'):\n        scored.append({'json': t})\n        continue\n    title = str(t.get('title') or '').lower()\n    padded = ' ' + title\n    stems = list(t.get('q_stems') or [])\n    words = list(t.get('q_words') or [])\n    q_cpv = list(t.get('q_cpv') or [])\n    cpv_list = str(t.get('cpv') or '').split()\n    raw = 0.0\n    why_pl = []\n    why_en = []\n\n    hits = [s for s in stems if s and s in title]\n    if hits:\n        raw += min(len(hits), 3) * 14\n        if any((' ' + s) in padded for s in hits):\n            raw += 8\n        shown = ', '.join(hits[:3])\n        why_pl.append('W tytule: ' + shown)\n        why_en.append('In the title: ' + shown)\n\n    if words and all((w in title) for w in words):\n        raw += 12\n        why_pl.append('Pasuje do całej frazy')\n        why_en.append('Matches the whole phrase')\n\n    best = 0\n    for q in q_cpv:\n        for c in cpv_list:\n            if c.startswith(q) and len(q) > best:\n                best = len(q)\n    if best >= 5:\n        raw += 30\n    elif best == 4:\n        raw += 22\n    elif best == 3:\n        raw += 14\n    if best:\n        why_pl.append('Zgodny kod branżowy (CPV)')\n        why_en.append('Matching industry code (CPV)')\n        if cpv_list and any(cpv_list[0].startswith(q) for q in q_cpv):\n            raw += 4\n\n    if t.get('q_province') and t.get('q_province') == t.get('province'):\n        raw += 6\n        why_pl.append('Szukane województwo')\n        why_en.append('Requested region')\n    if t.get('q_type') in ('works', 'services', 'delivery') and t.get('q_type') == t.get('order_type'):\n        raw += 5\n\n    days = t.get('days_left')\n    if days is not None:\n        if days <= 1:\n            raw -= 12\n        elif days <= 3:\n            raw -= 5\n        elif days >= 7:\n            raw += 3\n\n    score = int(max(1, min(100, round(raw * 100.0 / 90.0))))\n    t['score'] = score\n    t['why_pl'] = why_pl\n    t['why_en'] = why_en\n    scored.append({'json': t})\n\nscored.sort(key=lambda r: (-r['json'].get('score', 0), r['json'].get('days_left') if r['json'].get('days_left') is not None else 999))\nreturn scored"
+      },
+      "notes": "PL: Liczy trafność w skali 0-100 na podstawie słów w tytule, kodu branżowego, regionu i terminu. To zwykły, przejrzysty rachunek, bez magii.\nEN: Calculates relevance from 0 to 100 using title words, industry code, region and deadline. Plain, transparent maths, no magic."
+    },
+    {
+      "id": "32c3e1f6-af71-4d0f-8bff-d672601c22c9",
+      "name": "Zbuduj odpowiedź / Build response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2580,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javaScript",
+        "jsCode": "// PL: Składamy gotową odpowiedź dla strony: 12 najlepszych wyników i krótkie podsumowanie. Zapamiętujemy ją na 15 minut.\n// EN: We assemble the final answer for the page: the 12 best results and a short summary. We keep it for 15 minutes.\nconst ctx = $('Przygotuj zapytania / Build source queries').first().json.ctx;\nconst everything = $input.all().map((i) => i.json).filter((r) => r && !r._none);\n// PL: Bardzo słabe trafienia (ocena poniżej 20) tylko zaszmiecają listę, więc je pomijamy, jeśli zostaje sensowna liczba.\n// EN: Very weak matches (score below 20) only clutter the list, so we drop them when a sensible number remains.\nconst strong = everything.filter((r) => r.score >= 20);\nconst all = strong.length >= 3 ? strong : everything;\nconst level = (s) => (s >= 70 ? 'high' : s >= 45 ? 'medium' : 'low');\nconst results = all.slice(0, 12).map((r) => ({\n  id: r.notice_id, source: r.source, title: r.title, buyer: r.buyer, city: r.city, province: r.province,\n  order_type: r.order_type, cpv: String(r.cpv || '').split(' ').filter(Boolean).slice(0, 4), published: r.published, deadline: r.deadline,\n  days_left: r.days_left, url: r.url, object_id: r.object_id, est_value: r.est_value, score: r.score, level: level(r.score), why_pl: r.why_pl, why_en: r.why_en\n}));\nconst response = {\n  ok: true,\n  cached: false,\n  query: ctx.query,\n  lang: ctx.lang,\n  understood: { pl: ctx.intent_pl, en: ctx.intent_en, stems: ctx.stems, cpv: ctx.cpv, fallback: ctx.used_fallback },\n  total: all.length,\n  counts: { BZP: all.filter((r) => r.source === 'BZP').length, TED: all.filter((r) => r.source === 'TED').length },\n  took_ms: Date.now() - ctx.started_at,\n  results\n};\nif (!ctx.used_fallback && all.length) {\n  const store = $getWorkflowStaticData('global');\n  store.cache = store.cache || {};\n  store.cache[(ctx.query + '|' + (ctx.province || '')).toLowerCase()] = { t: Date.now(), data: response };\n  const keys = Object.keys(store.cache);\n  if (keys.length > 40) keys.sort((a, b) => store.cache[a].t - store.cache[b].t).slice(0, keys.length - 40).forEach((k) => { delete store.cache[k]; });\n}\nreturn [{ json: response }];"
+      },
+      "notes": "PL: Wybiera 12 najlepszych wyników i dokłada informację, co system zrozumiał.\nEN: Picks the 12 best results and adds what the system understood."
+    },
+    {
+      "id": "af945197-5d2f-43ee-9876-518e0c84d504",
+      "name": "Odpowiedz wynikami / Respond with results",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2840,
+        120
+      ],
+      "parameters": {
+        "respondWith": "firstIncomingItem",
+        "options": {}
+      },
+      "notes": "PL: Odsyła listę wyników do strony.\nEN: Sends the result list back to the page."
+    },
+    {
+      "id": "65ea2c5e-2382-4d07-bd76-4975445c4860",
+      "name": "Czy mamy wynik w pamięci? / Is it cached?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1020,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "cache-hit",
+              "leftValue": "={{ $json.cached }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": ""
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          }
+        }
+      },
+      "notes": "PL: Jeśli to samo wyszukiwanie było niedawno (do 15 min), odpowiedź wraca od razu, bez ponownego pytania źródeł.\nEN: If the same search was done recently (within 15 min), the answer returns at once without asking the sources again."
+    },
+    {
+      "id": "1bdfe3bc-280b-4dd7-940b-e3f2ce72ccb4",
+      "name": "Odpowiedz z pamięci / Respond from cache",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1280,
+        380
+      ],
+      "parameters": {
+        "options": {},
+        "respondWith": "json",
+        "responseBody": "={{ $json.response }}"
+      },
+      "notes": "PL: Odsyła zapamiętaną odpowiedź.\nEN: Sends back the stored answer."
+    },
+    {
+      "id": "cf23eee9-57f3-4934-a377-6b2f84b0cb92",
+      "name": "Karta przetargu / Tender card (POST radar-brief)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        240,
+        760
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "options": {
+          "allowedOrigins": "*"
+        },
+        "path": "radar-brief",
+        "responseMode": "responseNode"
+      },
+      "notes": "PL: Tu strona wysyła kliknięty przetarg, a dostaje kartę z oceną.\nEN: The page sends the clicked tender here and gets a card with an assessment back.",
+      "webhookId": "4c434ae1-6fbd-419f-8e92-7e8f38f990e2"
+    },
+    {
+      "id": "b3244daf-d372-4261-95f7-6a1c3e81fb3b",
+      "name": "Sprawdź kartę / Validate card request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        760
+      ],
+      "parameters": {
+        "jsCode": "// PL: Sprawdzamy dane karty przetargu i pilnujemy limitu zapytań (ochrona kosztów AI).\n// EN: We check the tender card request and guard the request limit (AI cost guard).\nconst first = $input.first().json || {};\nconst b = first.body || first || {};\nconst lang = b.lang === 'en' ? 'en' : 'pl';\nconst clean = (v, n) => String(v == null ? '' : v).split(' ').filter(Boolean).join(' ').slice(0, n);\nconst digits = (s) => String(s || '').split('').filter((ch) => ch >= '0' && ch <= '9').join('');\nconst cpvRaw = Array.isArray(b.cpv) ? b.cpv : String(b.cpv || '').split(' ');\nconst cpv = cpvRaw.map((c) => digits(c).slice(0, 8)).filter((c) => c.length >= 3).slice(0, 6);\nconst source = b.source === 'TED' ? 'TED' : 'BZP';\nconst objectId = clean(b.object_id, 60);\nconst idOk = objectId.length >= 20 && objectId.split('').every((ch) => '0123456789abcdefABCDEF-'.indexOf(ch) >= 0);\nconst store = $getWorkflowStaticData('global');\nconst hour = new Date().toISOString().slice(0, 13);\nif (store.briefHour !== hour) { store.briefHour = hour; store.briefCount = 0; }\nconst LIMIT = 150; // PL: maks. kart na godzinę / EN: max cards per hour\nconst MSG = { bad: { pl: 'Brak danych przetargu.', en: 'Missing tender data.' }, busy: { pl: 'Dużo osób przegląda karty. Spróbuj za kilka minut.', en: 'Many people are opening cards right now. Please try again in a few minutes.' } };\nlet ok = true;\nlet error = '';\nif (clean(b.title, 400).length < 3) { ok = false; error = MSG.bad[lang]; }\nelse if ((store.briefCount || 0) >= LIMIT) { ok = false; error = MSG.busy[lang]; }\nelse { store.briefCount = (store.briefCount || 0) + 1; }\nlet trimmed = cpv[0] || '';\nwhile (trimmed.length > 3 && trimmed.charAt(trimmed.length - 1) === '0') trimmed = trimmed.slice(0, -1);\nreturn [{ json: { ok, error, lang, id: clean(b.id, 80), source, object_id: idOk ? objectId : '', title: clean(b.title, 400), buyer: clean(b.buyer, 200), city: clean(b.city, 80), province: clean(b.province, 40), order_type: clean(b.order_type, 20), cpv, cpv5: trimmed.slice(0, 5), deadline: clean(b.deadline, 40), days_left: b.days_left == null ? null : Number(b.days_left), est_value: b.est_value == null ? null : Number(b.est_value), url: clean(b.url, 300), started_at: Date.now() } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Czyści dane z przeglądarki i pilnuje limitu kart na godzinę.\nEN: Cleans the data from the browser and guards the hourly card limit."
+    },
+    {
+      "id": "cc2ebeb3-69e4-44eb-aa57-7074ed99d9de",
+      "name": "Czy dane karty są poprawne? / Is the card request valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        760,
+        760
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "card-ok",
+              "leftValue": "={{ $json.ok }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": ""
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          }
+        }
+      },
+      "notes": "PL: Poprawne dane idą dalej, błędne dostają krótki komunikat.\nEN: Valid data goes on, invalid data gets a short message."
+    },
+    {
+      "id": "d2fda3fc-f23f-4c0e-ae15-dbb42ada7bd6",
+      "name": "Odpowiedz błędem karty / Respond with card error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1020,
+        940
+      ],
+      "parameters": {
+        "options": {
+          "responseCode": 400
+        },
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, error: $json.error } }}"
+      },
+      "notes": "PL: Czytelny komunikat zamiast błędu technicznego.\nEN: A readable message instead of a technical error."
+    },
+    {
+      "id": "6d5f678d-22af-4896-8cc3-e3506e1f3af6",
+      "name": "Pobierz treść ogłoszenia / Fetch notice text",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1020,
+        640
+      ],
+      "parameters": {
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "RadarPrzetargow-Portfolio/1.0"
+            }
+          ]
+        },
+        "method": "GET",
+        "options": {
+          "response": {
+            "response": {
+              "outputPropertyName": "data",
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 15000
+        },
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "url": "={{ $json.object_id ? 'https://ezamowienia.gov.pl/mo-board/api/v1/Board/GetNoticeHtmlBodyById?noticeId=' + $json.object_id : 'https://ezamowienia.gov.pl/mo-board/api/v1/Config' }}"
+      },
+      "notes": "PL: Pobiera pełną treść ogłoszenia z e-Zamówień (dla przetargów z BZP).\nEN: Fetches the full notice text from e-Zamówienia (for BZP tenders).",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 800,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "2db8935d-9a68-4c64-9458-341cda108ba1",
+      "name": "Wyciągnij dane z ogłoszenia / Extract notice facts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        640
+      ],
+      "parameters": {
+        "jsCode": "// PL: Wyciągamy z treści ogłoszenia to, co ważne dla wykonawcy: opis, kryteria, wadium, czas realizacji.\n// EN: We pull out what matters to a bidder: description, criteria, deposit, duration.\nconst card = $('Sprawdź kartę / Validate card request').first().json;\nconst raw = String(($input.first().json || {}).data || '');\nconst empty = { has_text: false, description: '', criteria: [], deposit: '', deposit_amount: '', duration: '', conditions: '' };\nif (card.source !== 'BZP' || raw.length < 200 || raw.charAt(0) === '{') return [{ json: empty }];\nconst NL = String.fromCharCode(10);\nconst TAB = String.fromCharCode(9);\nconst txt = raw.replace(/<br[^>]*>/gi, NL).replace(/<[/](p|h[0-9]|div|li|tr)>/gi, NL).replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').split(TAB).join(' ');\nconst lines = txt.split(NL).map((s) => s.split(' ').filter(Boolean).join(' ')).filter(Boolean);\nconst idx = (prefix, from) => { for (let i = from || 0; i < lines.length; i++) if (lines[i].indexOf(prefix) === 0) return i; return -1; };\nconst isLabel = (s) => /^[0-9]+[.][0-9]+/.test(s) || s.indexOf('SEKCJA') === 0;\nlet description = '';\nconst d0 = idx('4.2.2.) Krótki opis');\nif (d0 >= 0) {\n  const parts = [];\n  for (let i = d0 + 1; i < lines.length && parts.join(' ').length < 900; i++) { if (isLabel(lines[i])) break; parts.push(lines[i]); }\n  description = parts.join(' ').slice(0, 900);\n}\nconst du = idx('4.2.10.) Okres realizacji');\nconst duration = du >= 0 ? lines[du].split(':').slice(1).join(':').trim().slice(0, 120) : '';\nconst c0 = idx('4.3.) Kryteria oceny');\nconst c1 = c0 >= 0 ? idx('4.3.2.)', c0) : -1;\nconst criteria = [];\nif (c0 >= 0) for (let i = c0 + 1; i < (c1 > 0 ? c1 : c0 + 40) && i < lines.length; i++) { if (/^[0-9][)] .*(waga|%|pkt)/i.test(lines[i]) && criteria.length < 4) criteria.push(lines[i].replace(/[;.]$/, '').slice(0, 140)); }\nconst dp = idx('6.4.) Zamawiający wymaga wadium');\nconst deposit = dp >= 0 ? (lines[dp].indexOf('Tak') >= 0 ? 'yes' : 'no') : '';\nconst ma = txt.match(/wadium[^.]{0,120}?([0-9][0-9 ]{2,}(?:,[0-9]{1,2})?)[ ]*(?:zł|PLN)/i);\nconst cd = idx('5.3.) Warunki udziału');\nconst conditions = cd >= 0 ? (lines[cd].indexOf('Tak') >= 0 ? 'yes' : 'no') : '';\nreturn [{ json: { has_text: true, description, criteria, deposit, deposit_amount: ma ? ma[1].split(' ').join(' ').trim() + ' PLN' : '', duration, conditions } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Z długiego ogłoszenia wybiera 5 rzeczy: opis, kryteria wyboru oferty, wadium, czas realizacji i warunki udziału.\nEN: From the long notice it picks 5 things: description, selection criteria, deposit, duration and participation conditions."
+    },
+    {
+      "id": "b273be44-6912-4598-a137-72f3b956e3f3",
+      "name": "Przygotuj zapytania o wyniki / Build results requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        640
+      ],
+      "parameters": {
+        "jsCode": "// PL: Szukamy podobnych, już rozstrzygniętych przetargów (ten sam kod branżowy, ostatnie 200 dni).\n// EN: We look for similar tenders that are already decided (same industry code, last 200 days).\nconst card = $('Sprawdź kartę / Validate card request').first().json;\nconst now = new Date();\nconst iso = (d) => d.toISOString().slice(0, 19);\nconst from = iso(new Date(now.getTime() - 200 * 86400000));\nconst to = iso(now);\nif (!card.cpv5) return [{ json: { url: 'https://ezamowienia.gov.pl/mo-board/api/v1/Config' } }];\nconst base = 'https://ezamowienia.gov.pl/mo-board/api/v1/Board/Search?noticeType=TenderResultNotice&publicationDateFrom=' + from + '&publicationDateTo=' + to + '&SortingColumnName=PublicationDate&SortingDirection=DESC&pageSize=10&cpvCode=' + card.cpv5;\nreturn [1, 2, 3, 4].map((p) => ({ json: { url: base + '&pageNumber=' + p } }));",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Przygotowuje 4 zapytania o ogłoszenia o wyniku z tej samej branży.\nEN: Prepares 4 requests for result notices from the same industry."
+    },
+    {
+      "id": "afee722e-1eec-44e2-8e9d-9f3c473aeead",
+      "name": "Pobierz wyniki podobnych / Fetch similar results",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1800,
+        640
+      ],
+      "parameters": {
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "RadarPrzetargow-Portfolio/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "method": "GET",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchInterval": 0,
+              "batchSize": 4
+            }
+          },
+          "timeout": 15000
+        },
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "url": "={{ $json.url }}"
+      },
+      "notes": "PL: Pobiera listy rozstrzygniętych przetargów z oficjalnego API.\nEN: Fetches the lists of decided tenders from the official API.",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 800,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "0bd82809-fb94-48c1-a009-338118f82905",
+      "name": "Wybierz pojedyncze umowy / Keep single contracts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        640
+      ],
+      "parameters": {
+        "jsCode": "// PL: Zostawiamy tylko przetargi zakończone jedną umową z jednym wykonawcą (czyste dane do porównań).\n// EN: We keep only tenders that ended with one contract and one contractor (clean data for comparison).\nconst rows = [];\nfor (const it of $input.all()) {\n  const n = it.json || {};\n  if (!n.bzpNumber) continue;\n  const contractors = (n.contractors || []).filter((c) => c && c.contractorName);\n  if (String(n.procedureResult || '') !== 'zawarcieUmowy' || contractors.length !== 1) continue;\n  rows.push({ object_id: n.objectId, bzp: n.bzpNumber, published: n.publicationDate, winner: contractors[0].contractorName });\n}\nconst pick = rows.slice(0, 30);\nreturn pick.length ? pick.map((r) => ({ json: r })) : [{ json: { _none: true } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Odrzuca przetargi unieważnione i z wieloma częściami. Zostaje do 30 czystych przypadków.\nEN: Drops cancelled and multi-part tenders. Up to 30 clean cases remain."
+    },
+    {
+      "id": "4b9c9f79-5b92-43d3-9b2b-0fc06230e17f",
+      "name": "Pobierz treści wyników / Fetch result notices",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        2320,
+        640
+      ],
+      "parameters": {
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "RadarPrzetargow-Portfolio/1.0"
+            }
+          ]
+        },
+        "method": "GET",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchInterval": 0,
+              "batchSize": 10
+            }
+          },
+          "response": {
+            "response": {
+              "outputPropertyName": "data",
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 15000
+        },
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "url": "={{ $json.object_id ? 'https://ezamowienia.gov.pl/mo-board/api/v1/Board/GetNoticeHtmlBodyById?noticeId=' + $json.object_id : 'https://ezamowienia.gov.pl/mo-board/api/v1/Config' }}"
+      },
+      "notes": "PL: Pobiera pełną treść każdego ogłoszenia o wyniku (po 10 naraz), bo tam są ceny.\nEN: Fetches the full text of each result notice (10 at a time) because the prices are there.",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 800,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "7290504e-bc26-418d-b3e3-a6fe4276b81f",
+      "name": "Odczytaj ceny / Read prices",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2580,
+        640
+      ],
+      "parameters": {
+        "jsCode": "// PL: Z każdego ogłoszenia o wyniku odczytujemy liczbę ofert i ceny. Nazwy firm podajemy tylko dla spółek.\n// EN: From each result notice we read the number of offers and the prices. Company names are shown only for companies.\nconst NL = String.fromCharCode(10);\nconst TAB = String.fromCharCode(9);\nconst meta = $('Wybierz pojedyncze umowy / Keep single contracts').all();\nconst num = (s) => { if (!s) return null; const v = Number(String(s).split(' ').join('').replace(',', '.')); return Number.isFinite(v) && v > 0 ? v : null; };\nconst NUM = '([0-9][0-9 ]*(?:,[0-9]+)?)';\nconst grab = (txt, label) => { const m = txt.match(new RegExp(label + '[ ]*' + NUM + '[ ]*PLN')); return m ? num(m[1]) : null; };\nconst FORMS = ['sp. z o.o', 'sp. z o. o', 'sp.z o.o', 'sp z o o', 'spółka', 'spolka', 's.a.', 'sp. k', 'sp.k', 'sp. j', 'sp.j', 'gmbh', 'ltd', 's.r.o', 'a.s.'];\nconst isCompany = (name) => { const n = String(name || '').toLowerCase(); return FORMS.some((f) => n.indexOf(f) >= 0) || n.slice(-3) === ' sa'; };\nconst out = [];\n$input.all().forEach((it, i) => {\n  const raw = String((it.json || {}).data || '');\n  const m = meta[i] ? meta[i].json : {};\n  if (!raw || raw.charAt(0) === '{' || m._none) return;\n  const txt = raw.replace(/<br[^>]*>/gi, NL).replace(/<[/](p|h[0-9]|div|li|tr)>/gi, NL).replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').split(TAB).join(' ');\n  const flat = txt.split(NL).map((s) => s.split(' ').filter(Boolean).join(' ')).filter(Boolean).join(' | ');\n  const win = grab(flat, 'wykonawcy, któremu udzielono zamówienia:');\n  if (!win) return;\n  const mo = flat.match(/Liczba otrzymanych ofert lub wniosków:[ ]*([0-9]+)/);\n  out.push({ json: { notice: m.bzp || '', published: m.published || '', est: grab(flat, 'Wartość zamówienia[^:]*:'), win, min: grab(flat, 'najniższą ceną lub kosztem:'), max: grab(flat, 'najwyższą ceną lub kosztem:'), offers: mo ? Number(mo[1]) : null, winner: isCompany(m.winner) ? m.winner : 'Przedsiębiorca indywidualny / Sole trader' } });\n});\nreturn out.length ? out : [{ json: { _none: true } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Odczytuje: wartość szacunkową, najniższą i najwyższą ofertę, cenę wygranej i liczbę ofert. Osób fizycznych nie wymienia z nazwiska.\nEN: Reads: estimated value, lowest and highest offer, winning price and number of offers. Individuals are not named."
+    },
+    {
+      "id": "0705bdf8-4f48-47ee-a92b-b3633773a6d5",
+      "name": "Policz statystyki (Python) / Compute statistics (Python)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        640
+      ],
+      "parameters": {
+        "language": "pythonNative",
+        "mode": "runOnceForAllItems",
+        "pythonCode": "# PL: Z kilkunastu podobnych rozstrzygnięć liczymy, jak wyglądają ceny i konkurencja.\n# EN: From a dozen or so similar decisions we work out what prices and competition look like.\nrows = [i['json'] for i in _items if not i['json'].get('_none')]\n\ndef median(values):\n    s = sorted(values)\n    k = len(s)\n    if k == 0:\n        return None\n    mid = k // 2\n    if k % 2 == 1:\n        return s[mid]\n    return (s[mid - 1] + s[mid]) / 2.0\n\ndef quantile(values, q):\n    s = sorted(values)\n    if not s:\n        return None\n    return s[int(round((len(s) - 1) * q))]\n\ndef r3(x):\n    return None if x is None else round(x, 3)\n\nratios = [r['win'] / r['est'] for r in rows if r.get('win') and r.get('est') and 0.2 <= r['win'] / r['est'] <= 3]\nspreads = [r['max'] / r['min'] for r in rows if r.get('min') and r.get('max') and r['min'] > 0 and r['max'] >= r['min']]\noffers = [r['offers'] for r in rows if r.get('offers') is not None]\nwins = [r['win'] for r in rows if r.get('win')]\ncounts = {}\nfor r in rows:\n    name = r.get('winner') or ''\n    if name and 'Sole trader' not in name:\n        counts[name] = counts.get(name, 0) + 1\ntop = sorted(counts.items(), key=lambda kv: -kv[1])[:3]\n\nresult = {\n    'n': len(rows),\n    'n_with_ratio': len(ratios),\n    'median_ratio': r3(median(ratios)),\n    'p25_ratio': r3(quantile(ratios, 0.25)),\n    'p75_ratio': r3(quantile(ratios, 0.75)),\n    'below_estimate_share': r3(len([x for x in ratios if x < 1.0]) / float(len(ratios))) if ratios else None,\n    'avg_offers': r3(sum(offers) / float(len(offers))) if offers else None,\n    'single_offer_share': r3(len([x for x in offers if x == 1]) / float(len(offers))) if offers else None,\n    'median_spread': r3(median(spreads)),\n    'median_win_pln': int(median(wins)) if wins else None,\n    'top_winners': [{'name': k, 'wins': v} for k, v in top],\n}\nreturn [{'json': result}]"
+      },
+      "notes": "PL: Liczy medianę ceny wygranej względem wartości szacunkowej, średnią liczbę ofert i najczęstszych zwycięzców. To rachunek, nie zgadywanie.\nEN: Calculates the median winning price against the estimate, the average number of offers and the most frequent winners. Maths, not guessing."
+    },
+    {
+      "id": "b6cd21c7-1369-4fae-91e3-bad813d3e12e",
+      "name": "Zbierz dane dla AI / Gather data for AI",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3100,
+        640
+      ],
+      "parameters": {
+        "jsCode": "// PL: Składamy w jedną paczkę to, co AI ma ocenić: przetarg, treść ogłoszenia i statystyki rynku.\n// EN: We pack what the AI must assess: the tender, the notice text and the market statistics.\nconst card = $('Sprawdź kartę / Validate card request').first().json;\nlet facts = {};\ntry { facts = $('Wyciągnij dane z ogłoszenia / Extract notice facts').first().json; } catch (e) { facts = {}; }\nlet stats = {};\ntry { stats = $input.first().json || {}; } catch (e) { stats = {}; }\nconst payload = { tender: { title: card.title, buyer: card.buyer, city: card.city, province: card.province, type: card.order_type, cpv: card.cpv, deadline: card.deadline, days_left: card.days_left, estimated_value_pln: card.est_value }, notice_facts: facts, market_stats: stats };\nreturn [{ json: { payload: JSON.stringify(payload) } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Zbiera wszystko w jedno miejsce przed pytaniem AI.\nEN: Gathers everything in one place before asking the AI."
+    },
+    {
+      "id": "527bd5bf-a023-478d-b6ef-17c432b32196",
+      "name": "Oceń przetarg (AI) / Assess the tender (AI)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        3360,
+        640
+      ],
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "gpt-4.1-mini"
+        },
+        "operation": "response",
+        "options": {
+          "maxTokens": 1100,
+          "temperature": 0.3,
+          "textFormat": {
+            "textOptions": {
+              "type": "json_object"
+            }
+          }
+        },
+        "resource": "text",
+        "responses": {
+          "values": [
+            {
+              "content": "You are a careful public-procurement analyst helping a small Polish company decide whether to bid on a tender. You receive JSON with: tender (title, buyer, place, industry codes, deadline), notice_facts (description, selection criteria, deposit = the bid security called \"wadium\" in Polish, duration, participation conditions; may be empty), market_stats (a sample of similar finished tenders: n = sample size, median_ratio = winning price divided by the buyer's estimate, below_estimate_share, avg_offers, single_offer_share = share of tenders with only one offer, median_spread = highest offer divided by lowest, top_winners). Use ONLY the given facts and never invent numbers. If market_stats.n is below 6, say the data is limited. In Polish text always say \"wadium\" for the bid security. Reply with JSON only, using exactly these keys:\n\"verdict\": one of \"go\", \"consider\" or \"skip\" (go = clear opportunity, consider = depends on the company, skip = weak fit or too risky).\n\"headline_pl\" and \"headline_en\": one short line.\n\"summary_pl\" and \"summary_en\": 2 to 3 plain sentences a non-expert understands.\n\"requirements_pl\" and \"requirements_en\": arrays of 2 to 4 short bullets saying what the buyer asks for (from the facts).\n\"market_pl\" and \"market_en\": 1 to 2 sentences about price and competition, based only on market_stats.\n\"tips_pl\" and \"tips_en\": arrays of 2 to 3 short practical tips.\n\"risks_pl\" and \"risks_en\": arrays of 1 to 3 short risks.\nPlain language, no jargon. The Polish and English versions must say the same thing. This is not legal or financial advice.",
+              "role": "system"
+            },
+            {
+              "content": "={{ $json.payload }}",
+              "role": "user"
+            }
+          ]
+        },
+        "simplify": true
+      },
+      "notes": "PL: AI (twoje konto OpenAI) ocenia przetarg na podstawie faktów z ogłoszenia i statystyk. Daje wynik po polsku i po angielsku naraz.\nEN: AI (your OpenAI account) assesses the tender from the notice facts and the statistics. It answers in Polish and English at once.",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "id": "2baabc0e-93b5-4d2d-93ab-d28e27724689",
+      "name": "Zbuduj kartę / Build card",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3620,
+        640
+      ],
+      "parameters": {
+        "jsCode": "// PL: Składamy gotową kartę: fakty z ogłoszenia, statystyki rynku i ocenę AI.\n// EN: We assemble the final card: notice facts, market statistics and the AI assessment.\nconst card = $('Sprawdź kartę / Validate card request').first().json;\nlet facts = {};\ntry { facts = $('Wyciągnij dane z ogłoszenia / Extract notice facts').first().json; } catch (e) { facts = {}; }\nlet stats = {};\ntry { stats = $('Policz statystyki (Python) / Compute statistics (Python)').first().json; } catch (e) { stats = {}; }\nconst src = $input.first().json || {};\nfunction textOf(j) {\n  if (j && Array.isArray(j.output)) { for (const o of j.output) for (const c of (o.content || [])) if (c && c.text) return c.text; }\n  if (j && typeof j.output === 'string') return j.output;\n  return '';\n}\nlet ai = {};\nconst t = textOf(src);\nif (t && typeof t === 'object') ai = t;\nelse if (t) { const s = String(t); const a = s.indexOf('{'); const z = s.lastIndexOf('}'); if (a >= 0 && z > a) { try { ai = JSON.parse(s.slice(a, z + 1)); } catch (e) { ai = {}; } } }\nconst arr = (v) => (Array.isArray(v) ? v.map((x) => String(x)).slice(0, 4) : []);\nconst str = (v) => String(v || '').slice(0, 600);\nconst has = ai && (ai.summary_pl || ai.summary_en);\nconst brief = has ? { verdict: ['go', 'consider', 'skip'].indexOf(ai.verdict) >= 0 ? ai.verdict : 'consider', headline_pl: str(ai.headline_pl), headline_en: str(ai.headline_en), summary_pl: str(ai.summary_pl), summary_en: str(ai.summary_en), requirements_pl: arr(ai.requirements_pl), requirements_en: arr(ai.requirements_en), market_pl: str(ai.market_pl), market_en: str(ai.market_en), tips_pl: arr(ai.tips_pl), tips_en: arr(ai.tips_en), risks_pl: arr(ai.risks_pl), risks_en: arr(ai.risks_en) } : null;\nreturn [{ json: { ok: true, id: card.id, source: card.source, url: card.url, facts, stats, brief, ai_ok: !!brief, took_ms: Date.now() - card.started_at } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Zbiera fakty, statystyki i ocenę AI w jedną odpowiedź. Gdy AI zawiedzie, strona dalej pokaże fakty i statystyki.\nEN: Collects facts, statistics and the AI assessment into one answer. If the AI fails, the page still shows facts and statistics."
+    },
+    {
+      "id": "d44ae47c-3fc7-4dd8-bda1-e771efc37b31",
+      "name": "Odpowiedz kartą / Respond with card",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        3880,
+        640
+      ],
+      "parameters": {
+        "options": {},
+        "respondWith": "firstIncomingItem"
+      },
+      "notes": "PL: Odsyła kartę do strony.\nEN: Sends the card back to the page."
+    },
+    {
+      "id": "b3ed4866-67bf-4df4-a365-4333a8b5ad4f",
+      "name": "Obserwuj frazę / Watch a phrase (POST radar-watch)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        240,
+        1100
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "options": {
+          "allowedOrigins": "*"
+        },
+        "path": "radar-watch",
+        "responseMode": "responseNode"
+      },
+      "notes": "PL: Tu strona wysyła frazę, którą chcesz obserwować.\nEN: The page sends the phrase you want to watch here.",
+      "webhookId": "7cb03f03-ee9c-4abc-8b0b-758cab2563d5"
+    },
+    {
+      "id": "7b79a794-bc5d-4050-80ae-e327fef0efb3",
+      "name": "Sprawdź obserwację / Validate watch request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        500,
+        1100
+      ],
+      "parameters": {
+        "jsCode": "// PL: Sprawdzamy frazę do obserwowania i pilnujemy limitu zapisów na godzinę.\n// EN: We check the phrase to watch and guard the hourly limit of sign-ups.\nconst first = $input.first().json || {};\nconst b = first.body || first || {};\nconst lang = b.lang === 'en' ? 'en' : 'pl';\nconst phrase = String(b.query || '').split(' ').filter(Boolean).join(' ').slice(0, 120);\nconst store = $getWorkflowStaticData('global');\nconst hour = new Date().toISOString().slice(0, 13);\nif (store.watchHour !== hour) { store.watchHour = hour; store.watchCount = 0; }\nconst MSG = { short: { pl: 'Wpisz co najmniej 3 znaki.', en: 'Please enter at least 3 characters.' }, busy: { pl: 'Za dużo zapisów w tej godzinie. Spróbuj później.', en: 'Too many sign-ups this hour. Please try later.' } };\nlet ok = true;\nlet error = '';\nif (phrase.length < 3) { ok = false; error = MSG.short[lang]; }\nelse if ((store.watchCount || 0) >= 30) { ok = false; error = MSG.busy[lang]; }\nelse { store.watchCount = (store.watchCount || 0) + 1; }\nreturn [{ json: { ok, error, lang, phrase, started_at: Date.now() } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Pilnuje długości frazy i limitu zapisów.\nEN: Guards the phrase length and the sign-up limit."
+    },
+    {
+      "id": "e0d128c1-d7ab-401f-9040-1958b20fbd2d",
+      "name": "Czy obserwacja jest poprawna? / Is the watch request valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        760,
+        1100
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "watch-ok",
+              "leftValue": "={{ $json.ok }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": ""
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          }
+        }
+      },
+      "notes": "PL: Poprawna fraza idzie dalej.\nEN: A valid phrase goes on."
+    },
+    {
+      "id": "2fa30ec9-a3c0-4494-99c0-c83cc587a6d3",
+      "name": "Odpowiedz błędem obserwacji / Respond with watch error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1020,
+        1280
+      ],
+      "parameters": {
+        "options": {
+          "responseCode": 400
+        },
+        "respondWith": "json",
+        "responseBody": "={{ { ok: false, error: $json.error } }}"
+      },
+      "notes": "PL: Czytelny komunikat o błędzie.\nEN: A readable error message."
+    },
+    {
+      "id": "59333ab4-78cc-4e7a-803b-3305fcf84f8b",
+      "name": "Wczytaj obserwowane / Load watched phrases",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1020,
+        1100
+      ],
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "cachedResultName": "radar_watch",
+          "mode": "id",
+          "value": "YOUR_RADAR_WATCH_TABLE_ID"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "condition": "eq",
+              "keyName": "active",
+              "keyValue": "={{ true }}"
+            }
+          ]
+        },
+        "matchType": "allConditions",
+        "operation": "get",
+        "resource": "row",
+        "returnAll": true
+      },
+      "notes": "PL: Wczytuje frazy już obserwowane, żeby nie dublować i pilnować limitu.\nEN: Loads the phrases already watched, to avoid duplicates and guard the limit.",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "141540f1-da61-4b50-973a-bd6a0f28b0cb",
+      "name": "Zdecyduj / Decide",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1280,
+        1100
+      ],
+      "parameters": {
+        "jsCode": "// PL: Czy zapisać nową obserwację? Nie, jeśli taka już jest albo osiągnięto limit dla dema.\n// EN: Should we save a new watch? Not if it already exists or the demo limit is reached.\nconst v = $('Sprawdź obserwację / Validate watch request').first().json;\nconst rows = $input.all().map((i) => i.json).filter((r) => r && r.phrase);\nconst MAX = 20;\nconst dup = rows.find((r) => String(r.phrase).toLowerCase() === v.phrase.toLowerCase());\nlet action = 'create';\nif (dup) action = 'exists';\nelse if (rows.length >= MAX) action = 'limit';\nreturn [{ json: Object.assign({}, v, { action, total: rows.length, max: MAX }) }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Chroni przed duplikatami i zapełnieniem bazy.\nEN: Protects against duplicates and a full database."
+    },
+    {
+      "id": "030bfed3-588d-4463-9eb0-4699cb975327",
+      "name": "Czy zapisać? / Should we save it?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1540,
+        1100
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "watch-create",
+              "leftValue": "={{ $json.action }}",
+              "operator": {
+                "operation": "equals",
+                "type": "string"
+              },
+              "rightValue": "create"
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          }
+        }
+      },
+      "notes": "PL: Zapisujemy tylko nowe, mieszczące się w limicie.\nEN: We save only new ones within the limit."
+    },
+    {
+      "id": "8ddf69ea-91f6-45d4-b010-06aa903c6e71",
+      "name": "Odpowiedz: już jest lub limit / Respond: exists or limit",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1800,
+        1280
+      ],
+      "parameters": {
+        "options": {},
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, saved: false, reason: $json.action, message_pl: $json.action === 'exists' ? 'Ta fraza jest już obserwowana.' : 'Osiągnięto limit obserwowanych fraz w demo (' + $json.max + ').', message_en: $json.action === 'exists' ? 'This phrase is already being watched.' : 'The demo limit of watched phrases has been reached (' + $json.max + ').' } }}"
+      },
+      "notes": "PL: Uprzejma odpowiedź, gdy nie zapisujemy.\nEN: A polite answer when we do not save."
+    },
+    {
+      "id": "3b670ddc-e52f-4c6e-87bb-83eb303db73f",
+      "name": "Zrozum frazę do obserwacji (AI) / Understand the watched phrase (AI)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.3,
+      "position": [
+        1800,
+        1100
+      ],
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "gpt-4.1-mini"
+        },
+        "operation": "response",
+        "options": {
+          "maxTokens": 400,
+          "temperature": 0.2,
+          "textFormat": {
+            "textOptions": {
+              "type": "json_object"
+            }
+          }
+        },
+        "resource": "text",
+        "responses": {
+          "values": [
+            {
+              "content": "You help people find public tenders in Poland (BZP and TED). The user types a short phrase in Polish or English. Reply with JSON only, using exactly these keys:\n\"stems\": array of 2 to 5 SHORT Polish word stems (lowercase letters only, 4 to 8 letters, no spaces) that would appear INSIDE the title of a matching Polish tender. Use the part of the word that does not change with grammatical case, for example \"sprząt\" for sprzątanie/sprzątania, \"dach\" for dachu/dachowy, \"komputer\", \"remont\". Include close synonyms. If the user wrote English, translate the idea to Polish first.\n\"cpv\": array of 0 to 3 CPV code prefixes of 4 or 5 digits that best describe the subject, for example \"9091\" for cleaning services, \"4526\" for roofing works, \"3021\" for computers.\n\"intent_pl\": one short Polish sentence saying what you understood.\n\"intent_en\": the same sentence in English.\nNever invent facts. If the phrase makes no sense, return empty arrays.",
+              "role": "system"
+            },
+            {
+              "content": "={{ $json.phrase }}",
+              "role": "user"
+            }
+          ]
+        },
+        "simplify": true
+      },
+      "notes": "PL: AI (twoje konto OpenAI) zamienia frazę na słowa kluczowe i kody branżowe, które zapamiętujemy do alertów.\nEN: AI (your OpenAI account) turns the phrase into keywords and industry codes that we store for alerts.",
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "openAiApi": {
+          "id": "YOUR_OPENAI_CREDENTIAL_ID",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "id": "ccc7d0c7-dc00-40f2-b9ee-729271e4c46e",
+      "name": "Przygotuj wpis / Prepare watch entry",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        1100
+      ],
+      "parameters": {
+        "jsCode": "// PL: Zamieniamy odpowiedź AI na wpis do bazy: słowa kluczowe i kody branżowe do późniejszych alertów.\n// EN: We turn the AI answer into a database entry: keywords and industry codes for later alerts.\nconst v = $('Zdecyduj / Decide').first().json;\nconst src = $input.first().json || {};\nfunction textOf(j) {\n  if (j && Array.isArray(j.output)) { for (const o of j.output) for (const c of (o.content || [])) if (c && c.text) return c.text; }\n  if (j && typeof j.output === 'string') return j.output;\n  return '';\n}\nlet ai = {};\nconst t = textOf(src);\nif (t && typeof t === 'object') ai = t;\nelse if (t) { const s = String(t); const a = s.indexOf('{'); const z = s.lastIndexOf('}'); if (a >= 0 && z > a) { try { ai = JSON.parse(s.slice(a, z + 1)); } catch (e) { ai = {}; } } }\nconst clean = (arr, min, max) => [...new Set((Array.isArray(arr) ? arr : []).map((s) => String(s).toLowerCase().replace(/[^a-ząćęłńóśźż0-9]/g, '')).filter((s) => s.length >= min && s.length <= max))];\nlet stems = clean(ai.stems, 3, 9).slice(0, 4);\nif (!stems.length) stems = [...new Set(v.phrase.toLowerCase().replace(/[^a-ząćęłńóśźż0-9 ]/g, ' ').split(' ').filter((w) => w.length > 2).map((w) => w.slice(0, Math.max(4, w.length - 2))))].slice(0, 4);\nconst cpv = [...new Set((Array.isArray(ai.cpv) ? ai.cpv : []).map((c) => String(c).split('').filter((ch) => ch >= '0' && ch <= '9').join('')).filter((c) => c.length >= 3).map((c) => c.slice(0, 5)))].slice(0, 2);\nconst now = new Date().toISOString();\nreturn [{ json: { phrase: v.phrase, keywords: stems.join(','), cpv_prefixes: cpv.join(','), lang: v.lang, created: now, last_checked: now, hits_total: 0, active: true } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Składa wpis: fraza, słowa kluczowe, kody branżowe. Gdy AI zawiedzie, używa prostego planu B.\nEN: Builds the entry: phrase, keywords, industry codes. If the AI fails it uses a simple plan B."
+    },
+    {
+      "id": "871c0ff0-f772-4e74-9113-dd945778fdf0",
+      "name": "Zapisz obserwację / Save watch",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2320,
+        1100
+      ],
+      "parameters": {
+        "columns": {
+          "mappingMode": "defineBelow",
+          "schema": [
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "phrase",
+              "id": "phrase",
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "keywords",
+              "id": "keywords",
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "cpv_prefixes",
+              "id": "cpv_prefixes",
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "lang",
+              "id": "lang",
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "created",
+              "id": "created",
+              "required": false,
+              "type": "dateTime"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "last_checked",
+              "id": "last_checked",
+              "required": false,
+              "type": "dateTime"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "hits_total",
+              "id": "hits_total",
+              "required": false,
+              "type": "number"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "active",
+              "id": "active",
+              "required": false,
+              "type": "boolean"
+            }
+          ],
+          "value": {
+            "active": "={{ $json.active }}",
+            "cpv_prefixes": "={{ $json.cpv_prefixes }}",
+            "created": "={{ $json.created }}",
+            "hits_total": "={{ $json.hits_total }}",
+            "keywords": "={{ $json.keywords }}",
+            "lang": "={{ $json.lang }}",
+            "last_checked": "={{ $json.last_checked }}",
+            "phrase": "={{ $json.phrase }}"
+          }
+        },
+        "dataTableId": {
+          "__rl": true,
+          "cachedResultName": "radar_watch",
+          "mode": "id",
+          "value": "YOUR_RADAR_WATCH_TABLE_ID"
+        },
+        "operation": "insert",
+        "resource": "row"
+      },
+      "notes": "PL: Zapisuje obserwowaną frazę w bazie.\nEN: Stores the watched phrase in the database."
+    },
+    {
+      "id": "213825fb-d2b7-4c98-8c57-7496486d264e",
+      "name": "Odpowiedz: zapisano / Respond: saved",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        2580,
+        1100
+      ],
+      "parameters": {
+        "options": {},
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, saved: true, phrase: $('Przygotuj wpis / Prepare watch entry').first().json.phrase, stems: $('Przygotuj wpis / Prepare watch entry').first().json.keywords, cpv: $('Przygotuj wpis / Prepare watch entry').first().json.cpv_prefixes, message_pl: 'Zapisano. Gdy pojawi się nowy przetarg pasujący do tej frazy, przyjdzie powiadomienie na Telegramie (w tym demo trafia ono do właściciela projektu).', message_en: 'Saved. When a new tender matches this phrase, a Telegram notification is sent (in this demo it goes to the project owner).' } }}"
+      },
+      "notes": "PL: Potwierdza zapis i uczciwie mówi, gdzie trafi powiadomienie.\nEN: Confirms the save and honestly says where the notification goes."
+    },
+    {
+      "id": "66019c3a-3292-4364-b23e-9d937007916d",
+      "name": "Alerty co 2 godz. / Alerts every 2 hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        240,
+        1500
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 2
+            }
+          ]
+        }
+      },
+      "notes": "PL: Co 2 godziny sprawdza, czy są nowe przetargi do obserwowanych fraz.\nEN: Every 2 hours checks whether there are new tenders for the watched phrases."
+    },
+    {
+      "id": "866e06c8-2db6-4d49-bce3-5448d5cba828",
+      "name": "Wczytaj aktywne frazy / Load active phrases",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        500,
+        1500
+      ],
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "cachedResultName": "radar_watch",
+          "mode": "id",
+          "value": "YOUR_RADAR_WATCH_TABLE_ID"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "condition": "eq",
+              "keyName": "active",
+              "keyValue": "={{ true }}"
+            }
+          ]
+        },
+        "matchType": "allConditions",
+        "operation": "get",
+        "resource": "row",
+        "returnAll": true
+      },
+      "notes": "PL: Wczytuje wszystkie aktywne obserwacje. Gdy nie ma żadnej, nic się nie dzieje.\nEN: Loads all active watches. When there are none, nothing happens."
+    },
+    {
+      "id": "b96bcc9e-60e9-4112-806c-d6031568de96",
+      "name": "Zapytania dla fraz / Build alert requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        1500
+      ],
+      "parameters": {
+        "jsCode": "// PL: Dla każdej obserwowanej frazy pytamy BZP o otwarte ogłoszenia z ostatniej doby.\n// EN: For each watched phrase we ask BZP for open notices from the last 24 hours.\nconst now = new Date();\nconst iso = (d) => d.toISOString().slice(0, 19);\nconst from = iso(new Date(now.getTime() - 24 * 3600 * 1000));\nconst to = iso(new Date(now.getTime() + 86400000));\nconst open = iso(now);\nconst out = [];\nfor (const it of $input.all()) {\n  const w = it.json;\n  if (!w || !w.phrase) continue;\n  const base = 'https://ezamowienia.gov.pl/mo-board/api/v1/Board/Search?noticeType=ContractNotice&publicationDateFrom=' + from + '&publicationDateTo=' + to + '&submittingOffersDateFrom=' + open + '&SortingColumnName=PublicationDate&SortingDirection=DESC&pageSize=10&pageNumber=1';\n  const stems = String(w.keywords || '').split(',').filter(Boolean).slice(0, 4);\n  const cpvs = String(w.cpv_prefixes || '').split(',').filter(Boolean).slice(0, 2);\n  stems.forEach((s) => out.push({ json: { phrase: w.phrase, lang: w.lang, url: base + '&orderObject=' + encodeURIComponent(s) } }));\n  cpvs.forEach((c) => out.push({ json: { phrase: w.phrase, lang: w.lang, url: base + '&cpvCode=' + c } }));\n}\nreturn out;",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Do 6 zapytań na frazę (słowa kluczowe i kody branżowe). Zawsze patrzymy 24 godziny wstecz, a powtórki odsiewa dziennik.\nEN: Up to 6 requests per phrase (keywords and industry codes). We always look 24 hours back and the log filters out repeats."
+    },
+    {
+      "id": "f47e11d3-4f14-471f-9ac9-c444eabfde0b",
+      "name": "Pobierz nowe z BZP / Fetch new from BZP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        1020,
+        1500
+      ],
+      "parameters": {
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "RadarPrzetargow-Portfolio/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "method": "GET",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchInterval": 0,
+              "batchSize": 8
+            }
+          },
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "fullResponse": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "url": "={{ $json.url }}"
+      },
+      "notes": "PL: Pyta oficjalne API BZP o ogłoszenia z ostatniej doby.\nEN: Asks the official BZP API for notices from the last day.",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 800
+    },
+    {
+      "id": "e573a3ff-a570-46a6-ad82-3eca76f58a6f",
+      "name": "Wczytaj dziennik alertów / Load alert log",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        1500
+      ],
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "cachedResultName": "radar_alert_log",
+          "mode": "id",
+          "value": "YOUR_RADAR_ALERT_LOG_TABLE_ID"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "condition": "gt",
+              "keyName": "sent_at",
+              "keyValue": "={{ $now.minus({ days: 14 }).toISO() }}"
+            }
+          ]
+        },
+        "matchType": "allConditions",
+        "operation": "get",
+        "resource": "row",
+        "returnAll": true
+      },
+      "notes": "PL: Wczytuje, co już wysłaliśmy w ostatnich 14 dniach, żeby nikt nie dostał tego samego dwa razy.\nEN: Loads what we already sent in the last 14 days so nobody gets the same notice twice.",
+      "alwaysOutputData": true,
+      "executeOnce": true
+    },
+    {
+      "id": "39fa6bd5-19eb-4ae8-8198-ed60697ccc33",
+      "name": "Wybierz nowe ogłoszenia / Pick new notices",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1540,
+        1500
+      ],
+      "parameters": {
+        "jsCode": "// PL: Wybieramy tylko te ogłoszenia, których dana fraza jeszcze nie dostała, i składamy wiadomość na Telegram.\n// EN: We keep only the notices this phrase has not received yet and compose the Telegram message.\nconst NL = String.fromCharCode(10);\nconst reqs = $('Zapytania dla fraz / Build alert requests').all();\nconst fetched = $('Pobierz nowe z BZP / Fetch new from BZP').all();\nconst logRows = $('Wczytaj dziennik alertów / Load alert log').all().map((i) => i.json);\nconst sent = new Set(logRows.filter((r) => r && r.notice_id).map((r) => String(r.phrase || '') + '|' + String(r.notice_id)));\nconst now = Date.now();\nconst groups = new Map();\n// PL: Każde zapytanie daje dokładnie jedną odpowiedź, w tej samej kolejności, więc wiemy, do jakiej frazy należy.\n// EN: Each request gives exactly one response in the same order, so we know which phrase it belongs to.\nfetched.forEach((it, i) => {\n  const src = reqs[i] ? reqs[i].json : null;\n  if (!src || !src.phrase) return;\n  const body = it.json && Array.isArray(it.json.body) ? it.json.body : [];\n  for (const n of body) {\n    if (!n || !n.bzpNumber) continue;\n    const dl = n.submittingOffersDate ? Date.parse(n.submittingOffersDate) : NaN;\n    if (!isNaN(dl) && dl < now) continue;\n    if (sent.has(src.phrase + '|' + n.bzpNumber)) continue;\n    if (!groups.has(src.phrase)) groups.set(src.phrase, new Map());\n    groups.get(src.phrase).set(n.bzpNumber, { notice_id: n.bzpNumber, title: String(n.orderObject || '').split(' ').filter(Boolean).join(' '), buyer: String(n.organizationName || ''), city: String(n.organizationCity || ''), days_left: isNaN(dl) ? null : Math.max(0, Math.ceil((dl - now) / 86400000)), url: 'https://ezamowienia.gov.pl/mo-client-board/bzp/notice-details/id/' + n.objectId });\n  }\n});\nconst esc = (s) => String(s || '').split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;');\nconst out = [];\nfor (const [phrase, map] of groups) {\n  const list = [...map.values()];\n  if (!list.length) continue;\n  const lines = list.slice(0, 5).map((r) => '• <a href=\"' + r.url + '\">' + esc(r.title.slice(0, 110)) + '</a>' + NL + '   ' + esc(r.buyer.slice(0, 60)) + (r.city ? ', ' + esc(r.city) : '') + (r.days_left != null ? ' · ' + r.days_left + ' dni / days' : ''));\n  const more = list.length > 5 ? NL + '… +' + (list.length - 5) : '';\n  const text = '🔔 <b>Radar Przetargów · Tender Radar</b>' + NL + '<b>' + esc(phrase) + '</b>: ' + list.length + ' nowych / new' + NL + NL + lines.join(NL + NL) + more;\n  out.push({ json: { phrase, text, notices: list } });\n}\nreturn out;",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Odsiewa to, co już było wysłane, i składa jedną wiadomość na frazę (maks. 5 przetargów).\nEN: Filters out what was already sent and composes one message per phrase (max 5 tenders)."
+    },
+    {
+      "id": "8e8ba959-c2a9-4a86-87f0-31a5cd8863e8",
+      "name": "Wyślij alert na Telegram / Send Telegram alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1800,
+        1500
+      ],
+      "parameters": {
+        "additionalFields": {
+          "appendAttribution": false,
+          "disable_web_page_preview": true,
+          "parse_mode": "HTML"
+        },
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "operation": "sendMessage",
+        "replyMarkup": "none",
+        "resource": "message",
+        "text": "={{ $json.text }}"
+      },
+      "notes": "PL: Wysyła alert na Telegram przez bota Telegram account (konto właściciela projektu).\nEN: Sends the alert to Telegram through the Telegram account (the project owner's account).",
+      "webhookId": "f15be21e-cfa2-4e8c-9a39-509779e18b72",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 4000,
+      "credentials": {
+        "telegramApi": {
+          "id": "YOUR_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "c3c14b84-ec08-4e63-96b7-1038c157049b",
+      "name": "Wpisy do dziennika / Prepare log rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        1500
+      ],
+      "parameters": {
+        "jsCode": "// PL: Zapisujemy, co zostało wysłane, żeby nie wysyłać tego ponownie.\n// EN: We record what was sent so we do not send it again.\nconst rows = [];\nconst nowIso = new Date().toISOString();\nfor (const it of $('Wybierz nowe ogłoszenia / Pick new notices').all()) {\n  for (const r of (it.json.notices || [])) rows.push({ json: { notice_id: r.notice_id, phrase: it.json.phrase, title: String(r.title).slice(0, 200), url: r.url, sent_at: nowIso } });\n}\nreturn rows;",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Zamienia wysłane wiadomości na wpisy do dziennika.\nEN: Turns the sent messages into log entries.",
+      "executeOnce": true
+    },
+    {
+      "id": "7c2dc869-7467-4e0d-b197-d71c1e3bd54c",
+      "name": "Zapisz w dzienniku / Save to alert log",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        2320,
+        1500
+      ],
+      "parameters": {
+        "columns": {
+          "mappingMode": "defineBelow",
+          "schema": [
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "notice_id",
+              "id": "notice_id",
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "phrase",
+              "id": "phrase",
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "title",
+              "id": "title",
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "url",
+              "id": "url",
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "sent_at",
+              "id": "sent_at",
+              "required": false,
+              "type": "dateTime"
+            }
+          ],
+          "value": {
+            "notice_id": "={{ $json.notice_id }}",
+            "phrase": "={{ $json.phrase }}",
+            "sent_at": "={{ $json.sent_at }}",
+            "title": "={{ $json.title }}",
+            "url": "={{ $json.url }}"
+          }
+        },
+        "dataTableId": {
+          "__rl": true,
+          "cachedResultName": "radar_alert_log",
+          "mode": "id",
+          "value": "YOUR_RADAR_ALERT_LOG_TABLE_ID"
+        },
+        "operation": "insert",
+        "resource": "row"
+      },
+      "notes": "PL: Dopisuje wysłane ogłoszenia do dziennika.\nEN: Adds the sent notices to the log."
+    },
+    {
+      "id": "0254b173-f0ed-4dc9-be9d-862f2b1fc73a",
+      "name": "Kontrola źródeł codziennie / Daily source check",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        240,
+        1900
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "daysInterval": 1,
+              "field": "days",
+              "triggerAtHour": 7,
+              "triggerAtMinute": 30
+            }
+          ]
+        }
+      },
+      "notes": "PL: Codziennie o 7:30 sprawdza, czy źródła odpowiadają.\nEN: Every day at 7:30 it checks that the sources respond."
+    },
+    {
+      "id": "2ecc88d8-f2a3-401c-92ba-eda2516d7771",
+      "name": "Sprawdź BZP / Check BZP",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        500,
+        1900
+      ],
+      "parameters": {
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "RadarPrzetargow-Portfolio/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "method": "GET",
+        "options": {
+          "timeout": 15000
+        },
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "url": "https://ezamowienia.gov.pl/mo-board/api/v1/Board/Search?noticeType=ContractNotice&pageSize=1&pageNumber=1"
+      },
+      "notes": "PL: Próbne zapytanie do BZP o jedno ogłoszenie.\nEN: A test request to BZP for one notice.",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 800,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "641b9cda-55ba-46c2-860e-7eeb073d8ad2",
+      "name": "Sprawdź TED / Check TED",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [
+        760,
+        1900
+      ],
+      "parameters": {
+        "contentType": "json",
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "RadarPrzetargow-Portfolio/1.0"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "jsonBody": "{\"query\":\"buyer-country=POL AND form-type=competition\",\"fields\":[\"publication-number\"],\"page\":1,\"limit\":1,\"scope\":\"ACTIVE\",\"paginationMode\":\"PAGE_NUMBER\"}",
+        "method": "POST",
+        "options": {
+          "timeout": 15000
+        },
+        "sendBody": true,
+        "sendHeaders": true,
+        "specifyBody": "json",
+        "specifyHeaders": "keypair",
+        "url": "https://api.ted.europa.eu/v3/notices/search"
+      },
+      "notes": "PL: Próbne zapytanie do TED o jedno ogłoszenie.\nEN: A test request to TED for one notice.",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 800,
+      "alwaysOutputData": true
+    },
+    {
+      "id": "c4dfc41b-346f-4ba7-a444-3be39768d1c6",
+      "name": "Oceń stan źródeł / Evaluate source health",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        1900
+      ],
+      "parameters": {
+        "jsCode": "// PL: Sprawdzamy, czy oba źródła zwróciły dane, i przygotowujemy ostrzeżenie, jeśli nie.\n// EN: We check that both sources returned data and prepare a warning if not.\nconst NL = String.fromCharCode(10);\nconst b = $('Sprawdź BZP / Check BZP').first().json || {};\nconst t = $('Sprawdź TED / Check TED').first().json || {};\nconst bzpOk = !!b.bzpNumber;\nconst tedOk = Array.isArray(t.notices) && t.notices.length > 0;\nconst ts = new Date().toISOString();\nconst problems = [];\nif (!bzpOk) problems.push('BZP');\nif (!tedOk) problems.push('TED');\nconst text = problems.length ? '⚠️ <b>Radar Przetargów · Tender Radar</b>' + NL + 'Źródło nie odpowiada / Source not responding: <b>' + problems.join(', ') + '</b>' + NL + ts.slice(0, 16).split('T').join(' ') + ' UTC' : '';\nreturn [{ json: { ts, bzp_ok: bzpOk, ted_ok: tedOk, problems, has_problem: problems.length > 0, text, state_value: JSON.stringify({ ts, bzp_ok: bzpOk, ted_ok: tedOk }) } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Ocenia, czy BZP i TED działają. Jeśli nie, przygotowuje ostrzeżenie.\nEN: Judges whether BZP and TED work. If not, it prepares a warning."
+    },
+    {
+      "id": "249a4645-85df-4761-a4e9-57eeccaa2f15",
+      "name": "Zapisz stan zdrowia / Save health state",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        1840
+      ],
+      "parameters": {
+        "columns": {
+          "mappingMode": "defineBelow",
+          "schema": [
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "state_key",
+              "id": "state_key",
+              "required": false,
+              "type": "string"
+            },
+            {
+              "canBeUsedToMatch": true,
+              "defaultMatch": false,
+              "display": true,
+              "displayName": "state_value",
+              "id": "state_value",
+              "required": false,
+              "type": "string"
+            }
+          ],
+          "value": {
+            "state_key": "health_last",
+            "state_value": "={{ $json.state_value }}"
+          }
+        },
+        "dataTableId": {
+          "__rl": true,
+          "cachedResultName": "radar_state",
+          "mode": "id",
+          "value": "YOUR_RADAR_STATE_TABLE_ID"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "condition": "eq",
+              "keyName": "state_key",
+              "keyValue": "health_last"
+            }
+          ]
+        },
+        "matchType": "allConditions",
+        "operation": "upsert",
+        "resource": "row"
+      },
+      "notes": "PL: Zapisuje wynik kontroli, żeby strona mogła pokazać status źródeł.\nEN: Stores the check result so the page can show the sources status."
+    },
+    {
+      "id": "df8c93e1-e4f2-4cd0-a7c4-fe273e96aed0",
+      "name": "Wyczyść stary dziennik / Clean old alert log",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1540,
+        1840
+      ],
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "cachedResultName": "radar_alert_log",
+          "mode": "id",
+          "value": "YOUR_RADAR_ALERT_LOG_TABLE_ID"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "condition": "lt",
+              "keyName": "sent_at",
+              "keyValue": "={{ $now.minus({ days: 30 }).toISO() }}"
+            }
+          ]
+        },
+        "matchType": "allConditions",
+        "operation": "deleteRows",
+        "resource": "row"
+      },
+      "notes": "PL: Usuwa wpisy dziennika starsze niż 30 dni, żeby baza nie rosła w nieskończoność.\nEN: Deletes log entries older than 30 days so the database does not grow forever.",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "7f032676-7fdc-467c-b81c-0cd51579ed7b",
+      "name": "Czy jest problem? / Any problem?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1280,
+        1980
+      ],
+      "parameters": {
+        "conditions": {
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "health-problem",
+              "leftValue": "={{ $json.has_problem }}",
+              "operator": {
+                "operation": "true",
+                "singleValue": true,
+                "type": "boolean"
+              },
+              "rightValue": ""
+            }
+          ],
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          }
+        }
+      },
+      "notes": "PL: Ostrzeżenie wysyłamy tylko, gdy coś nie działa.\nEN: We send a warning only when something is not working."
+    },
+    {
+      "id": "6463a581-c9a1-480c-9566-98f11b3971e9",
+      "name": "Wyślij ostrzeżenie / Send warning",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1540,
+        1980
+      ],
+      "parameters": {
+        "additionalFields": {
+          "appendAttribution": false,
+          "parse_mode": "HTML"
+        },
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "operation": "sendMessage",
+        "replyMarkup": "none",
+        "resource": "message",
+        "text": "={{ $json.text }}"
+      },
+      "notes": "PL: Wysyła ostrzeżenie na Telegram.\nEN: Sends the warning to Telegram.",
+      "webhookId": "8c9fb928-9b29-4978-b4bf-b737c98125a7",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 4000,
+      "credentials": {
+        "telegramApi": {
+          "id": "YOUR_TELEGRAM_CREDENTIAL_ID",
+          "name": "Telegram account"
+        }
+      }
+    },
+    {
+      "id": "d2f830f3-bfa1-43ce-83cf-acc0a7211e10",
+      "name": "Status źródeł / Sources status (GET radar-status)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        240,
+        2300
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "options": {
+          "allowedOrigins": "*"
+        },
+        "path": "radar-status",
+        "responseMode": "responseNode"
+      },
+      "notes": "PL: Strona pyta tu, czy źródła działają.\nEN: The page asks here whether the sources are working.",
+      "webhookId": "77754ddf-9066-4189-a36c-97703555e081"
+    },
+    {
+      "id": "02f097af-978a-4c90-9fd3-0519d87169ab",
+      "name": "Wczytaj stan / Load health state",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        500,
+        2300
+      ],
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "cachedResultName": "radar_state",
+          "mode": "id",
+          "value": "YOUR_RADAR_STATE_TABLE_ID"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "condition": "eq",
+              "keyName": "state_key",
+              "keyValue": "health_last"
+            }
+          ]
+        },
+        "limit": 1,
+        "matchType": "allConditions",
+        "operation": "get",
+        "resource": "row",
+        "returnAll": false
+      },
+      "notes": "PL: Wczytuje wynik ostatniej kontroli.\nEN: Loads the result of the last check.",
+      "alwaysOutputData": true
+    },
+    {
+      "id": "53154da3-0c7e-4ee0-98a6-f13a6890a936",
+      "name": "Przygotuj status / Build status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        2300
+      ],
+      "parameters": {
+        "jsCode": "// PL: Zamieniamy zapisany wynik kontroli na prostą odpowiedź dla strony.\n// EN: We turn the stored check result into a simple answer for the page.\nconst row = $input.first().json || {};\nlet st = {};\ntry { st = JSON.parse(row.state_value || '{}'); } catch (e) { st = {}; }\nconst known = !!st.ts;\nconst label = (ok) => (!known ? 'unknown' : ok === true ? 'ok' : 'down');\nreturn [{ json: { ok: true, known, checked_at: st.ts || null, sources: { BZP: label(st.bzp_ok), TED: label(st.ted_ok) } } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Składa status: BZP i TED działa, nie działa lub nieznany.\nEN: Builds the status: BZP and TED working, not working or unknown."
+    },
+    {
+      "id": "d412171f-4f7d-4822-a3c4-0a9673cec68e",
+      "name": "Odpowiedz statusem / Respond with status",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1020,
+        2300
+      ],
+      "parameters": {
+        "options": {},
+        "respondWith": "firstIncomingItem"
+      },
+      "notes": "PL: Odsyła status do strony.\nEN: Sends the status to the page."
+    },
+    {
+      "id": "7035c120-722a-46f6-8904-40f479de14f2",
+      "name": "Strona wyszukiwarki / Search page (GET radar)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        240,
+        2700
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "options": {},
+        "path": "radar",
+        "responseMode": "responseNode"
+      },
+      "notes": "PL: Pod tym adresem otwiera się gotowa strona wyszukiwarki.\nEN: The ready search page opens at this address.",
+      "webhookId": "e49df1d3-04d7-4e6a-ad03-0d56ae42ad89"
+    },
+    {
+      "id": "65c43eff-a68d-4e8c-96e7-dcd58346e5c3",
+      "name": "Pliki strony / Page files",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        500,
+        2700
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "page-css",
+              "name": "page_css",
+              "type": "string",
+              "value": ":root{--bg:#fff;--ink:#0f172a;--mut:#5b6b82;--line:#e4e9f0;--soft:#f5f7fa;--ac:#1d4ed8;--acs:#eef3ff;--good:#157347;--goods:#e8f5ee;--warn:#b45309;--warns:#fdf3e4;--r:14px}\n*{box-sizing:border-box}\nhtml{-webkit-text-size-adjust:100%;scroll-behavior:smooth}\nbody{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}\na{color:var(--ac)}\n.wrap{max-width:940px;margin:0 auto;padding:0 20px}\n.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}\n.top{border-bottom:1px solid var(--line);background:rgba(255,255,255,.92);backdrop-filter:blur(8px);position:sticky;top:0;z-index:5}\n.bar{display:flex;align-items:center;justify-content:space-between;gap:12px;height:60px}\n.brand{display:flex;align-items:center;gap:10px;font-weight:650;letter-spacing:-.01em}\n.logo{width:22px;height:22px;border-radius:50%;border:2px solid var(--ac);position:relative;flex:none}\n.logo:after{content:'';position:absolute;inset:4px;border-radius:50%;background:var(--ac)}\n.bar-right{display:flex;align-items:center;gap:16px}\n.status{font-size:13px;color:var(--mut);display:flex;align-items:center;gap:6px}\n.status i{width:8px;height:8px;border-radius:50%;background:var(--good);display:inline-block}\n.status.bad i{background:var(--warn)}\n.lang{display:flex;border:1px solid var(--line);border-radius:999px;padding:2px}\n.lang button{border:0;background:none;padding:4px 12px;border-radius:999px;font:inherit;font-size:13px;font-weight:600;color:var(--mut);cursor:pointer}\n.lang button[aria-pressed=true]{background:var(--ink);color:#fff}\n.hero{padding:56px 20px 24px;text-align:center}\nh1{font-size:clamp(28px,5.2vw,44px);line-height:1.12;letter-spacing:-.03em;margin:0 0 14px}\n.lead{max-width:640px;margin:0 auto 28px;color:var(--mut);font-size:17px}\n.search{display:flex;gap:8px;max-width:780px;margin:0 auto;padding:8px;border:1px solid var(--line);border-radius:18px;box-shadow:0 8px 30px rgba(15,23,42,.06);background:#fff;align-items:center}\n.search:focus-within{border-color:var(--ac);box-shadow:0 0 0 4px var(--acs)}\n.search input{flex:1;min-width:0;border:0;outline:0;font:inherit;font-size:17px;padding:10px 12px;background:none;color:var(--ink)}\n.search select{border:0;border-left:1px solid var(--line);background:none;font:inherit;font-size:14px;color:var(--mut);padding:6px 8px;max-width:150px;outline:0;cursor:pointer}\n.btn{border:0;border-radius:12px;background:var(--ac);color:#fff;font:inherit;font-weight:600;padding:10px 22px;cursor:pointer;text-decoration:none;display:inline-block}\n.btn:hover{filter:brightness(1.08)}\n.btn:disabled{opacity:.6;cursor:default}\n.btn.soft{background:var(--acs);color:var(--ac);padding:8px 16px;font-size:14px}\n.btn.ghost{background:#fff;color:var(--ink);border:1px solid var(--line);padding:8px 16px;font-size:14px}\n:focus-visible{outline:3px solid var(--ac);outline-offset:2px}\n.chips{margin-top:16px;color:var(--mut);font-size:14px}\n.chip{margin:4px 3px;border:1px solid var(--line);background:#fff;color:var(--ink);padding:5px 12px;border-radius:999px;font:inherit;font-size:14px;cursor:pointer}\n.chip:hover{border-color:var(--ac);color:var(--ac)}\n#results{min-height:60px;padding-bottom:30px}\n.rhead{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;margin:18px 0 6px;padding:14px 16px;background:var(--soft);border-radius:var(--r)}\n.rhead p{margin:0;font-size:15px}\n.rhead .und{color:var(--mut);font-size:14px;margin-top:2px}\n.card{display:flex;gap:16px;border:1px solid var(--line);border-radius:var(--r);padding:18px;margin:12px 0;background:#fff;transition:box-shadow .15s}\n.card:hover{box-shadow:0 6px 24px rgba(15,23,42,.06)}\n.score{--c:var(--mut);flex:none;width:54px;height:54px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--c) calc(var(--p)*1%),var(--line) 0);position:relative}\n.score:before{content:'';position:absolute;inset:5px;background:#fff;border-radius:50%}\n.score b{position:relative;font-size:16px}\n.score.l-high{--c:var(--good)}\n.score.l-medium{--c:var(--ac)}\n.score.l-low{--c:#94a3b8}\n.cbody{min-width:0;flex:1}\n.meta{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px}\n.tag{border:1px solid var(--line);border-radius:6px;padding:1px 8px;color:var(--mut);font-weight:600}\n.lvl{color:var(--mut)}\nh3{margin:6px 0 4px;font-size:18px;line-height:1.3;letter-spacing:-.01em;overflow-wrap:anywhere}\n.buyer{margin:0;color:var(--mut);font-size:14px}\n.when{margin:6px 0 0;font-size:14px}\n.when.warn{color:var(--warn);font-weight:600}\n.why{list-style:none;padding:0;margin:10px 0 0;display:flex;flex-wrap:wrap;gap:6px}\n.why li{background:var(--soft);border-radius:999px;padding:2px 10px;font-size:12px;color:var(--mut)}\n.actions{display:flex;flex-wrap:wrap;align-items:center;gap:14px;margin-top:14px}\n.link{font-size:14px;text-decoration:none;font-weight:600}\n.link:hover{text-decoration:underline}\n.brief{margin-top:16px;border-top:1px dashed var(--line);padding-top:16px}\n.verdict{display:flex;flex-wrap:wrap;gap:6px 12px;align-items:baseline;padding:10px 14px;border-radius:10px;background:var(--soft)}\n.verdict strong{font-size:15px}\n.verdict span{color:var(--mut);font-size:14px}\n.v-go{background:var(--goods)}\n.v-go strong{color:var(--good)}\n.v-consider{background:var(--warns)}\n.v-consider strong{color:var(--warn)}\n.sum{margin:12px 0}\n.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px 24px}\n.sec h4{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}\n.sec ul{margin:0;padding-left:18px;font-size:14px}\n.sec li{margin:3px 0}\n.full{grid-column:1/-1}\n.kv{display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:14px;margin:0}\n.kv dt{color:var(--mut)}\n.kv dd{margin:0}\n.gauge{position:relative;height:10px;background:var(--soft);border-radius:99px;margin:32px 8px 28px}\n.band{position:absolute;top:0;bottom:0;background:#c7d5fb;border-radius:99px}\n.est{position:absolute;top:-7px;bottom:-7px;width:2px;background:var(--ink)}\n.est small,.dot small{position:absolute;white-space:nowrap;font-size:11px;color:var(--mut);left:50%;transform:translateX(-50%)}\n.est small{top:100%;margin-top:3px}\n.dot{position:absolute;top:50%;width:16px;height:16px;margin:-8px 0 0 -8px;background:var(--ac);border:3px solid #fff;border-radius:50%;box-shadow:0 0 0 1px var(--ac)}\n.dot small{bottom:100%;margin-bottom:4px;color:var(--ac);font-weight:700;font-size:12px}\n.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:8px}\n.stat{background:var(--soft);border-radius:10px;padding:10px 12px}\n.stat b{display:block;font-size:18px}\n.stat span{font-size:12px;color:var(--mut)}\n.muted{color:var(--mut);font-size:14px}\n.note{background:var(--warns);border-radius:10px;padding:10px 14px;font-size:14px;margin:0 0 12px}\n.disc{font-size:12px;color:var(--mut);margin:14px 0 0}\n.skel{display:grid;gap:10px}\n.skel i{display:block;height:14px;border-radius:7px;background:linear-gradient(90deg,var(--soft),#e9eef5,var(--soft));background-size:200% 100%;animation:sh 1.3s infinite}\n.skel i:nth-child(2){width:80%}\n.skel i:nth-child(3){width:60%}\n@keyframes sh{to{background-position:-200% 0}}\n.loader{text-align:center;padding:48px 0;color:var(--mut)}\n.spin{width:30px;height:30px;border:3px solid var(--line);border-top-color:var(--ac);border-radius:50%;margin:0 auto 14px;animation:rot .8s linear infinite}\n@keyframes rot{to{transform:rotate(360deg)}}\n.empty{text-align:center;color:var(--mut);padding:40px 10px}\n.how{padding-top:34px;padding-bottom:20px}\n.how h2{font-size:22px;letter-spacing:-.02em;margin:0 0 16px}\n.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:18px}\n.steps div{border:1px solid var(--line);border-radius:var(--r);padding:16px}\n.steps b{display:block;margin-bottom:4px}\n.steps p{margin:0;color:var(--mut);font-size:14px}\nfooter{border-top:1px solid var(--line);margin-top:30px;padding:22px 0;color:var(--mut);font-size:13px}\nfooter p{margin:4px 0}\n.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--ink);color:#fff;padding:12px 18px;border-radius:12px;max-width:min(560px,90vw);font-size:14px;z-index:20;box-shadow:0 10px 30px rgba(0,0,0,.25)}\n[hidden]{display:none!important}\n@media(max-width:700px){.grid,.steps{grid-template-columns:1fr}.card{flex-direction:column;gap:10px}.search{flex-wrap:wrap}.search input{flex:1 1 100%}.search select{border-left:0;flex:1}.bar-right{gap:8px}.status span{display:none}}\n@media(prefers-reduced-motion:reduce){*{animation:none!important;scroll-behavior:auto!important}}"
+            },
+            {
+              "id": "page-body",
+              "name": "page_body",
+              "type": "string",
+              "value": "<header class='top'><div class='wrap bar'><div class='brand'><span class='logo' aria-hidden='true'></span><span data-i18n='brand'></span></div><div class='bar-right'><span id='status' class='status' hidden><i></i><span id='stxt'></span></span><div class='lang' role='group' aria-label='Language'><button type='button' id='l-pl'>PL</button><button type='button' id='l-en'>EN</button></div></div></div></header>\n<main>\n<section class='hero wrap'><h1 data-i18n='h1'></h1><p class='lead' data-i18n='lead'></p>\n<form id='f' class='search' role='search'><label class='sr' for='q' data-i18n='label'></label><input id='q' type='search' maxlength='160' autocomplete='off' data-i18n-ph='ph'><select id='prov' aria-label='Region'></select><button class='btn' type='submit' data-i18n='go'></button></form>\n<div class='chips'><span data-i18n='tryl'></span> <span id='chips'></span></div></section>\n<section class='wrap' id='results' aria-live='polite'></section>\n<section class='wrap how'><h2 data-i18n='how_h'></h2><div class='steps'><div><b data-i18n='h1t'></b><p data-i18n='h1d'></p></div><div><b data-i18n='h2t'></b><p data-i18n='h2d'></p></div><div><b data-i18n='h3t'></b><p data-i18n='h3d'></p></div></div></section>\n</main>\n<footer><div class='wrap'><p data-i18n='foot'></p><p><span data-i18n='by'></span> <a href='https://mrozikdigital.com' target='_blank' rel='noopener'>MrozikDigital</a></p></div></footer>\n<div id='toast' class='toast' role='status' hidden></div>"
+            },
+            {
+              "id": "page-js",
+              "name": "page_js",
+              "type": "string",
+              "value": "(function () {\n  var API = 'https://filmro.app.n8n.cloud/webhook/';\n  var PROV = ['dolnośląskie', 'kujawsko-pomorskie', 'lubelskie', 'lubuskie', 'łódzkie', 'małopolskie', 'mazowieckie', 'opolskie', 'podkarpackie', 'podlaskie', 'pomorskie', 'śląskie', 'świętokrzyskie', 'warmińsko-mazurskie', 'wielkopolskie', 'zachodniopomorskie'];\n  var EX = {\n    pl: ['sprzątanie biur', 'remont dachu szkoła', 'komputery dla szkoły', 'budowa drogi gminnej', 'dostawa leków'],\n    en: ['office cleaning', 'school roof repair', 'computers for a school', 'municipal road construction', 'medicines supply']\n  };\n  var T = {\n    pl: {\n      title: 'Radar Przetargów · wyszukiwarka przetargów publicznych', brand: 'Radar Przetargów', h1: 'Znajdź przetarg, który warto złożyć',\n      lead: 'Wpisz zwykłymi słowami, czego szukasz. Radar przeszuka na żywo przetargi z BZP i TED, oceni trafność i podpowie, czy warto się zgłosić.',\n      label: 'Czego szukasz?', ph: 'np. sprzątanie biur, remont dachu, komputery', go: 'Szukaj', all: 'Cała Polska', tryl: 'Spróbuj:',\n      s0: 'Rozumiem frazę…', s1: 'Pytam BZP i TED…', s2: 'Łączę wyniki i usuwam powtórki…', s3: 'Oceniam trafność…',\n      under: 'Rozumiem:', found: 'Znaleziono {n} otwartych przetargów (BZP: {b}, TED: {d}). Pokazuję {m} najlepszych.', cachedn: 'z pamięci podręcznej',\n      none: 'Nie znaleziono otwartych przetargów dla tej frazy. Spróbuj prostszych słów albo wybierz Całą Polskę.',\n      lv_high: 'Mocne dopasowanie', lv_medium: 'Dobry trop', lv_low: 'Luźne dopasowanie',\n      ty_works: 'Roboty budowlane', ty_services: 'Usługi', ty_delivery: 'Dostawy',\n      deadline: 'Termin ofert', value: 'wartość', today: 'dziś', tomorrow: 'jutro', inDays: 'za {n} dni',\n      analyze: 'Pokaż analizę', hide: 'Ukryj analizę', original: 'Otwórz ogłoszenie',\n      v_go: 'Warto się zgłosić', v_consider: 'Zależy od twojej firmy', v_skip: 'Raczej odpuść',\n      sec_req: 'Czego wymaga zamawiający', sec_facts: 'Kluczowe dane z ogłoszenia', sec_market: 'Rynek: ceny i konkurencja', sec_tips: 'Wskazówki', sec_risks: 'Ryzyka',\n      f_deposit: 'Wadium', f_duration: 'Czas realizacji', f_cond: 'Warunki udziału', f_crit: 'Kryterium', yes: 'tak', no: 'nie',\n      m_ratio: 'Zwycięska cena względem wartości szacunkowej', m_est: 'szacunek', m_offers: 'Średnia liczba ofert', m_single: 'Przetargi z jedną ofertą', m_below: 'Wygrane poniżej szacunku', m_win: 'Typowa cena zwycięzcy', m_top: 'Najczęstsi zwycięzcy', m_n: 'Na podstawie {n} podobnych, rozstrzygniętych przetargów.', nomarket: 'Za mało podobnych rozstrzygniętych przetargów, żeby policzyć rynek.',\n      noai: 'Ocena AI jest chwilowo niedostępna, ale poniżej są fakty z ogłoszenia i statystyki rynku.',\n      disc: 'Ocena ma charakter pomocniczy. To nie jest porada prawna ani finansowa. Zawsze sprawdź treść ogłoszenia.',\n      watch: 'Obserwuj tę frazę', watchnote: 'Gdy pojawi się nowy przetarg, dostaniesz alert na Telegramie (w tym demo trafia on do właściciela projektu).',\n      err: 'Coś poszło nie tak. Spróbuj ponownie za chwilę.', short: 'Wpisz co najmniej 2 znaki.', retry: 'Spróbuj ponownie', st_ok: 'Źródła działają', st_bad: 'Źródło chwilowo nie odpowiada',\n      how_h: 'Jak to działa', h1t: 'Wpisujesz zwykłe słowa', h1d: 'AI zamienia je na słowa kluczowe i kody branżowe (CPV), żeby nie przegapić ogłoszeń zapisanych inaczej.', h2t: 'Pytamy źródła na żywo', h2d: 'BZP (e-Zamówienia) i TED to oficjalne, darmowe źródła. Nie kopiujemy baz, więc dane są zawsze świeże.', h3t: 'Dostajesz ocenę', h3d: 'Trafność od 0 do 100, a po kliknięciu analiza: wymagania, wadium, typowe ceny i konkurencja z podobnych przetargów.',\n      foot: 'Dane: BZP (Urząd Zamówień Publicznych) i TED (Unia Europejska). Narzędzie pomocnicze, nie porada prawna ani finansowa.', by: 'Zbudował'\n    },\n    en: {\n      title: 'Tender Radar · public tender search', brand: 'Tender Radar', h1: 'Find the tender worth bidding on',\n      lead: 'Type what you are looking for in plain words. The radar searches BZP and TED live, scores each tender and tells you whether it is worth a bid.',\n      label: 'What are you looking for?', ph: 'e.g. office cleaning, roof repair, computers', go: 'Search', all: 'All of Poland', tryl: 'Try:',\n      s0: 'Understanding your phrase…', s1: 'Asking BZP and TED…', s2: 'Joining results and removing repeats…', s3: 'Scoring relevance…',\n      under: 'I understand:', found: 'Found {n} open tenders (BZP: {b}, TED: {d}). Showing the best {m}.', cachedn: 'from cache',\n      none: 'No open tenders found for this phrase. Try simpler words or choose All of Poland.',\n      lv_high: 'Strong match', lv_medium: 'Good lead', lv_low: 'Loose match',\n      ty_works: 'Works', ty_services: 'Services', ty_delivery: 'Supplies',\n      deadline: 'Offers due', value: 'value', today: 'today', tomorrow: 'tomorrow', inDays: 'in {n} days',\n      analyze: 'Show analysis', hide: 'Hide analysis', original: 'Open notice',\n      v_go: 'Worth bidding', v_consider: 'Depends on your company', v_skip: 'Probably skip',\n      sec_req: 'What the buyer asks for', sec_facts: 'Key facts from the notice', sec_market: 'Market: prices and competition', sec_tips: 'Tips', sec_risks: 'Risks',\n      f_deposit: 'Bid security (wadium)', f_duration: 'Duration', f_cond: 'Participation conditions', f_crit: 'Criterion', yes: 'yes', no: 'no',\n      m_ratio: 'Winning price compared with the buyer estimate', m_est: 'estimate', m_offers: 'Average number of offers', m_single: 'Tenders with a single offer', m_below: 'Wins below the estimate', m_win: 'Typical winning price', m_top: 'Most frequent winners', m_n: 'Based on {n} similar decided tenders.', nomarket: 'Too few similar decided tenders to work out the market.',\n      noai: 'The AI assessment is temporarily unavailable, but the notice facts and market statistics are below.',\n      disc: 'This assessment is a helping tool, not legal or financial advice. Always read the notice itself.',\n      watch: 'Watch this phrase', watchnote: 'When a new tender appears you get a Telegram alert (in this demo it goes to the project owner).',\n      err: 'Something went wrong. Please try again in a moment.', short: 'Enter at least 2 characters.', retry: 'Try again', st_ok: 'Sources are up', st_bad: 'A source is not responding',\n      how_h: 'How it works', h1t: 'You type plain words', h1d: 'AI turns them into keywords and industry codes (CPV), so tenders worded differently are not missed.', h2t: 'We ask the sources live', h2d: 'BZP (e-Zamówienia) and TED are official, free sources. We do not copy databases, so the data is always fresh.', h3t: 'You get a score', h3d: 'Relevance from 0 to 100, and on click an analysis: requirements, bid security, typical prices and competition from similar tenders.',\n      foot: 'Data: BZP (Public Procurement Office, Poland) and TED (European Union). A helping tool, not legal or financial advice.', by: 'Built by'\n    }\n  };\n  var lang = 'pl';\n  try {\n    var sv = localStorage.getItem('radar_lang');\n    if (sv === 'pl' || sv === 'en') lang = sv;\n    else if (String(navigator.language || '').slice(0, 2) === 'en') lang = 'en';\n  } catch (e) {}\n  var state = { query: '', data: null, cache: {}, status: null };\n  var timer = null;\n  var toastTimer = null;\n\n  function $(id) { return document.getElementById(id); }\n  function esc(s) { return String(s == null ? '' : s).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;').split(String.fromCharCode(39)).join('&#39;'); }\n  function t(k, v) {\n    var s = T[lang][k] != null ? T[lang][k] : k;\n    if (v) Object.keys(v).forEach(function (n) { s = s.split('{' + n + '}').join(v[n]); });\n    return s;\n  }\n  function safeUrl(u) { u = String(u || ''); return u.indexOf('https://') === 0 ? u : '#'; }\n  function loc() { return lang === 'pl' ? 'pl-PL' : 'en-GB'; }\n  function fmtDate(iso) { var d = new Date(iso); return isNaN(d) ? '' : d.toLocaleDateString(loc(), { day: 'numeric', month: 'short', year: 'numeric' }); }\n  function pln(n) { return new Intl.NumberFormat(loc(), { maximumFractionDigits: 0 }).format(n) + ' PLN'; }\n  function pct(x) { return Math.round(Number(x) * 100) + '%'; }\n  function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : s; }\n  function pickText(o, k) { return (lang === 'pl' ? o[k + '_pl'] : o[k + '_en']) || ''; }\n  function pickList(o, k) { return (lang === 'pl' ? o[k + '_pl'] : o[k + '_en']) || []; }\n  function items(a) { return (a || []).map(function (x) { return '<li>' + esc(x) + '</li>'; }).join(''); }\n\n  function toast(msg) {\n    var n = $('toast');\n    n.textContent = msg;\n    n.hidden = false;\n    clearTimeout(toastTimer);\n    toastTimer = setTimeout(function () { n.hidden = true; }, 7000);\n  }\n\n  function post(path, body, ms) {\n    var ctl = typeof AbortController === 'function' ? new AbortController() : null;\n    var to = setTimeout(function () { if (ctl) ctl.abort(); }, ms || 45000);\n    return fetch(API + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: ctl ? ctl.signal : undefined })\n      .then(function (r) { clearTimeout(to); return r.json(); });\n  }\n\n  function applyLang() {\n    document.documentElement.lang = lang;\n    document.title = t('title');\n    Array.prototype.forEach.call(document.querySelectorAll('[data-i18n]'), function (n) { n.textContent = t(n.getAttribute('data-i18n')); });\n    Array.prototype.forEach.call(document.querySelectorAll('[data-i18n-ph]'), function (n) { n.setAttribute('placeholder', t(n.getAttribute('data-i18n-ph'))); });\n    $('l-pl').setAttribute('aria-pressed', String(lang === 'pl'));\n    $('l-en').setAttribute('aria-pressed', String(lang === 'en'));\n    var sel = $('prov');\n    var cur = sel.value;\n    sel.innerHTML = '';\n    var o0 = document.createElement('option');\n    o0.value = '';\n    o0.textContent = t('all');\n    sel.appendChild(o0);\n    PROV.forEach(function (p) { var o = document.createElement('option'); o.value = p; o.textContent = cap(p); sel.appendChild(o); });\n    sel.value = cur;\n    var ch = $('chips');\n    ch.innerHTML = '';\n    EX[lang].forEach(function (q) {\n      var b = document.createElement('button');\n      b.type = 'button';\n      b.className = 'chip';\n      b.textContent = q;\n      b.addEventListener('click', function () { $('q').value = q; doSearch(q); });\n      ch.appendChild(b);\n    });\n    renderStatus();\n    if (state.data) renderResults();\n  }\n\n  function setLang(l) {\n    lang = l;\n    try { localStorage.setItem('radar_lang', l); } catch (e) {}\n    applyLang();\n  }\n\n  function startLoader() {\n    var i = 0;\n    $('results').innerHTML = `<div class='loader'><div class='spin'></div><p id='lmsg'>${esc(t('s0'))}</p></div>`;\n    clearInterval(timer);\n    timer = setInterval(function () { i = Math.min(i + 1, 3); var m = $('lmsg'); if (m) m.textContent = t('s' + i); }, 1800);\n  }\n\n  function stopLoader() { clearInterval(timer); timer = null; }\n\n  function showError(msg) {\n    $('results').innerHTML = `<div class='empty'><p>${esc(msg || t('err'))}</p><button type='button' class='btn soft' data-act='retry'>${esc(t('retry'))}</button></div>`;\n  }\n\n  function doSearch(q) {\n    q = String(q || '').trim();\n    if (q.length < 2) { toast(t('short')); return; }\n    state.query = q;\n    state.cache = {};\n    state.data = null;\n    startLoader();\n    post('radar-search', { query: q, lang: lang, province: $('prov').value }, 60000).then(function (d) {\n      stopLoader();\n      if (!d || d.ok !== true) { showError(d && d.error); return; }\n      state.data = d;\n      renderResults();\n    }).catch(function () { stopLoader(); showError(); });\n  }\n\n  function card(r, i) {\n    var typ = r.order_type ? t('ty_' + r.order_type) : '';\n    var rel = r.days_left == null ? '' : (r.days_left === 0 ? t('today') : (r.days_left === 1 ? t('tomorrow') : t('inDays', { n: r.days_left })));\n    var warn = r.days_left != null && r.days_left <= 3;\n    var why = (lang === 'pl' ? r.why_pl : r.why_en) || [];\n    var place = [r.city, r.province].filter(Boolean).join(', ');\n    var sc = Number(r.score) || 0;\n    return `<article class='card' data-i='${i}'>\n      <div class='score l-${esc(r.level)}' style='--p:${sc}' title='${esc(t('lv_' + r.level))}'><b>${sc}</b></div>\n      <div class='cbody'>\n        <div class='meta'><span class='tag'>${esc(r.source)}</span>${typ ? `<span class='tag'>${esc(typ)}</span>` : ''}<span class='lvl'>${esc(t('lv_' + r.level))}</span></div>\n        <h3>${esc(r.title)}</h3>\n        <p class='buyer'>${esc(r.buyer)}${place ? ' · ' + esc(place) : ''}</p>\n        <p class='when${warn ? ' warn' : ''}'>${esc(t('deadline'))}: ${esc(fmtDate(r.deadline))}${rel ? ' · ' + esc(rel) : ''}${r.est_value ? ' · ' + esc(t('value')) + ': ' + esc(pln(r.est_value)) : ''}</p>\n        ${why.length ? `<ul class='why'>${items(why)}</ul>` : ''}\n        <div class='actions'><button type='button' class='btn soft' data-act='brief' aria-expanded='false'>${esc(t('analyze'))}</button><a class='link' href='${esc(safeUrl(r.url))}' target='_blank' rel='noopener noreferrer'>${esc(t('original'))} ↗</a></div>\n        <div class='brief' hidden></div>\n      </div>\n    </article>`;\n  }\n\n  function renderResults() {\n    var d = state.data;\n    var box = $('results');\n    if (!d) return;\n    if (!d.results || !d.results.length) { box.innerHTML = `<div class='empty'>${esc(t('none'))}</div>`; return; }\n    var und = d.understood ? (lang === 'pl' ? d.understood.pl : d.understood.en) : '';\n    var head = `<div class='rhead'><div><p><b>${esc(t('found', { n: d.total, b: d.counts.BZP, d: d.counts.TED, m: d.results.length }))}</b>${d.cached ? ' · ' + esc(t('cachedn')) : ''}</p>${und ? `<p class='und'>${esc(t('under'))} ${esc(und)}</p>` : ''}</div><button type='button' class='btn ghost' id='watchbtn'>${esc(t('watch'))}</button></div><p class='muted'>${esc(t('watchnote'))}</p>`;\n    box.innerHTML = head + d.results.map(card).join('');\n    $('watchbtn').addEventListener('click', watch);\n  }\n\n  function marketHtml(s) {\n    if (!s || !s.n) return `<p class='muted'>${esc(t('nomarket'))}</p>`;\n    var out = '';\n    if (s.median_ratio) {\n      var lo = 0.7, hi = 1.5;\n      var at = function (v) { return Math.max(0, Math.min(100, ((v - lo) / (hi - lo)) * 100)); };\n      var a = at(s.p25_ratio || s.median_ratio);\n      var z = at(s.p75_ratio || s.median_ratio);\n      out += `<p class='muted' style='margin:0'>${esc(t('m_ratio'))}</p><div class='gauge'><span class='band' style='left:${a}%;width:${Math.max(2, z - a)}%'></span><span class='est' style='left:${at(1)}%'><small>${esc(t('m_est'))}</small></span><span class='dot' style='left:${at(s.median_ratio)}%'><small>${pct(s.median_ratio)}</small></span></div>`;\n    }\n    var st = [];\n    if (s.avg_offers != null) st.push([Number(s.avg_offers).toFixed(1), t('m_offers')]);\n    if (s.single_offer_share != null) st.push([pct(s.single_offer_share), t('m_single')]);\n    if (s.below_estimate_share != null) st.push([pct(s.below_estimate_share), t('m_below')]);\n    if (s.median_win_pln) st.push([pln(s.median_win_pln), t('m_win')]);\n    out += `<div class='stats'>${st.map(function (x) { return `<div class='stat'><b>${esc(x[0])}</b><span>${esc(x[1])}</span></div>`; }).join('')}</div>`;\n    if (s.top_winners && s.top_winners.length) out += `<p class='muted' style='margin:10px 0 0'><b>${esc(t('m_top'))}:</b> ${s.top_winners.map(function (w) { return esc(w.name) + ' (' + w.wins + ')'; }).join('; ')}</p>`;\n    out += `<p class='muted' style='margin:8px 0 0'>${esc(t('m_n', { n: s.n }))}</p>`;\n    return out;\n  }\n\n  function briefHtml(b) {\n    var br = b.brief;\n    var f = b.facts || {};\n    var out = '';\n    if (br) out += `<div class='verdict v-${esc(br.verdict)}'><strong>${esc(t('v_' + br.verdict))}</strong><span>${esc(pickText(br, 'headline'))}</span></div><p class='sum'>${esc(pickText(br, 'summary'))}</p>`;\n    else out += `<p class='note'>${esc(t('noai'))}</p>`;\n    var facts = [];\n    if (f.deposit === 'yes') facts.push([t('f_deposit'), f.deposit_amount ? t('yes') + ' · ' + f.deposit_amount : t('yes')]);\n    if (f.deposit === 'no') facts.push([t('f_deposit'), t('no')]);\n    if (f.duration) facts.push([t('f_duration'), f.duration]);\n    if (f.conditions) facts.push([t('f_cond'), f.conditions === 'yes' ? t('yes') : t('no')]);\n    (f.criteria || []).forEach(function (c) { facts.push([t('f_crit'), c]); });\n    var req = br ? pickList(br, 'requirements') : [];\n    var tips = br ? pickList(br, 'tips') : [];\n    var risks = br ? pickList(br, 'risks') : [];\n    out += `<div class='grid'>`;\n    if (req.length) out += `<div class='sec'><h4>${esc(t('sec_req'))}</h4><ul>${items(req)}</ul></div>`;\n    if (facts.length) out += `<div class='sec'><h4>${esc(t('sec_facts'))}</h4><dl class='kv'>${facts.map(function (x) { return '<dt>' + esc(x[0]) + '</dt><dd>' + esc(x[1]) + '</dd>'; }).join('')}</dl></div>`;\n    out += `<div class='sec full'><h4>${esc(t('sec_market'))}</h4>${br && pickText(br, 'market') ? `<p style='margin:0 0 4px'>${esc(pickText(br, 'market'))}</p>` : ''}${marketHtml(b.stats)}</div>`;\n    if (tips.length) out += `<div class='sec'><h4>${esc(t('sec_tips'))}</h4><ul>${items(tips)}</ul></div>`;\n    if (risks.length) out += `<div class='sec'><h4>${esc(t('sec_risks'))}</h4><ul>${items(risks)}</ul></div>`;\n    out += `</div><p class='disc'>${esc(t('disc'))}</p>`;\n    return out;\n  }\n\n  function toggleBrief(cardEl, i, btn) {\n    var box = cardEl.querySelector('.brief');\n    var r = state.data.results[i];\n    if (!box.hidden) { box.hidden = true; btn.setAttribute('aria-expanded', 'false'); btn.textContent = t('analyze'); return; }\n    box.hidden = false;\n    btn.setAttribute('aria-expanded', 'true');\n    btn.textContent = t('hide');\n    if (state.cache[r.id]) { box.innerHTML = briefHtml(state.cache[r.id]); return; }\n    box.innerHTML = `<div class='skel'><i></i><i></i><i></i></div>`;\n    post('radar-brief', { id: r.id, source: r.source, object_id: r.object_id, title: r.title, buyer: r.buyer, city: r.city, province: r.province, order_type: r.order_type, cpv: r.cpv, deadline: r.deadline, days_left: r.days_left, est_value: r.est_value, url: r.url, lang: lang }, 70000).then(function (b) {\n      if (!b || b.ok !== true) { box.innerHTML = `<p class='note'>${esc((b && b.error) || t('err'))}</p>`; return; }\n      state.cache[r.id] = b;\n      box.innerHTML = briefHtml(b);\n    }).catch(function () { box.innerHTML = `<p class='note'>${esc(t('err'))}</p>`; });\n  }\n\n  function watch() {\n    if (!state.query) return;\n    var btn = $('watchbtn');\n    btn.disabled = true;\n    post('radar-watch', { query: state.query, lang: lang }, 40000).then(function (d) {\n      btn.disabled = false;\n      toast(d && d.ok === false ? d.error : (lang === 'pl' ? d.message_pl : d.message_en));\n    }).catch(function () { btn.disabled = false; toast(t('err')); });\n  }\n\n  function renderStatus() {\n    var s = state.status;\n    var box = $('status');\n    if (!s || !s.known) { box.hidden = true; return; }\n    var bad = s.sources.BZP !== 'ok' || s.sources.TED !== 'ok';\n    box.hidden = false;\n    box.className = 'status' + (bad ? ' bad' : '');\n    $('stxt').textContent = bad ? t('st_bad') : t('st_ok');\n  }\n\n  function loadStatus() {\n    fetch(API + 'radar-status').then(function (r) { return r.json(); }).then(function (s) { state.status = s; renderStatus(); }).catch(function () {});\n  }\n\n  $('results').addEventListener('click', function (e) {\n    var b = e.target.closest ? e.target.closest('[data-act]') : null;\n    if (!b) return;\n    var act = b.getAttribute('data-act');\n    var c = b.closest('.card');\n    if (act === 'brief' && c) toggleBrief(c, Number(c.getAttribute('data-i')), b);\n    if (act === 'retry') doSearch(state.query);\n  });\n  $('f').addEventListener('submit', function (e) { e.preventDefault(); doSearch($('q').value); });\n  $('l-pl').addEventListener('click', function () { setLang('pl'); });\n  $('l-en').addEventListener('click', function () { setLang('en'); });\n  applyLang();\n  loadStatus();\n  try {\n    var qp = new URLSearchParams(location.search).get('q');\n    if (qp) { $('q').value = qp; doSearch(qp); }\n  } catch (e) {}\n})();"
+            }
+          ]
+        },
+        "includeOtherFields": false,
+        "mode": "manual"
+      },
+      "notes": "PL: Trzy części strony w jednym miejscu: wygląd (CSS), treść (HTML) i działanie (JavaScript). Łatwo zmienić jedną bez ruszania pozostałych.\nEN: The three parts of the page in one place: look (CSS), content (HTML) and behaviour (JavaScript). Easy to change one without touching the others."
+    },
+    {
+      "id": "6ca2ee2d-7645-437d-92e5-d873701ec36a",
+      "name": "Złóż stronę / Assemble page",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        2700
+      ],
+      "parameters": {
+        "jsCode": "// PL: Składamy trzy części w jeden dokument HTML.\n// EN: We join the three parts into one HTML document.\nconst f = $input.first().json;\nconst html = '<!doctype html><html lang=\"pl\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Radar Przetargów · Tender Radar</title><meta name=\"description\" content=\"Wyszukiwarka przetargów publicznych PL/EN. Public tenders search PL/EN.\"><style>' + f.page_css + '</style></head><body>' + f.page_body + '<script>' + f.page_js + '</script></body></html>';\nreturn [{ json: { html } }];",
+        "language": "javaScript",
+        "mode": "runOnceForAllItems"
+      },
+      "notes": "PL: Składa całość w gotową stronę.\nEN: Puts everything together into the finished page."
+    },
+    {
+      "id": "89e8f69d-4cc3-4cc3-b763-8573d0b9e7f5",
+      "name": "Odpowiedz stroną / Respond with page",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1020,
+        2700
+      ],
+      "parameters": {
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-cache"
+              }
+            ]
+          }
+        },
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}"
+      },
+      "notes": "PL: Odsyła stronę do przeglądarki.\nEN: Sends the page to the browser."
+    }
+  ],
+  "connections": {
+    "Wyszukiwanie / Search (POST radar-search)": {
+      "main": [
+        [
+          {
+            "node": "Sprawdź zapytanie / Validate input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sprawdź zapytanie / Validate input": {
+      "main": [
+        [
+          {
+            "node": "Czy fraza jest poprawna? / Is the phrase valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Czy fraza jest poprawna? / Is the phrase valid?": {
+      "main": [
+        [
+          {
+            "node": "Czy mamy wynik w pamięci? / Is it cached?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Odpowiedz błędem / Respond with error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zrozum frazę (AI) / Understand the phrase (AI)": {
+      "main": [
+        [
+          {
+            "node": "Przygotuj zapytania / Build source queries",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Przygotuj zapytania / Build source queries": {
+      "main": [
+        [
+          {
+            "node": "Pobierz z BZP / Fetch from BZP",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Pobierz z TED / Fetch from TED",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pobierz z BZP / Fetch from BZP": {
+      "main": [
+        [
+          {
+            "node": "Połącz źródła / Combine sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Połącz źródła / Combine sources": {
+      "main": [
+        [
+          {
+            "node": "Ujednolić i usuń duplikaty / Normalize & deduplicate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pobierz z TED / Fetch from TED": {
+      "main": [
+        [
+          {
+            "node": "Połącz źródła / Combine sources",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Ujednolić i usuń duplikaty / Normalize & deduplicate": {
+      "main": [
+        [
+          {
+            "node": "Oceń trafność (Python) / Score relevance (Python)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Oceń trafność (Python) / Score relevance (Python)": {
+      "main": [
+        [
+          {
+            "node": "Zbuduj odpowiedź / Build response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zbuduj odpowiedź / Build response": {
+      "main": [
+        [
+          {
+            "node": "Odpowiedz wynikami / Respond with results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Czy mamy wynik w pamięci? / Is it cached?": {
+      "main": [
+        [
+          {
+            "node": "Odpowiedz z pamięci / Respond from cache",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Zrozum frazę (AI) / Understand the phrase (AI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Karta przetargu / Tender card (POST radar-brief)": {
+      "main": [
+        [
+          {
+            "node": "Sprawdź kartę / Validate card request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sprawdź kartę / Validate card request": {
+      "main": [
+        [
+          {
+            "node": "Czy dane karty są poprawne? / Is the card request valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Czy dane karty są poprawne? / Is the card request valid?": {
+      "main": [
+        [
+          {
+            "node": "Pobierz treść ogłoszenia / Fetch notice text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Odpowiedz błędem karty / Respond with card error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pobierz treść ogłoszenia / Fetch notice text": {
+      "main": [
+        [
+          {
+            "node": "Wyciągnij dane z ogłoszenia / Extract notice facts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wyciągnij dane z ogłoszenia / Extract notice facts": {
+      "main": [
+        [
+          {
+            "node": "Przygotuj zapytania o wyniki / Build results requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Przygotuj zapytania o wyniki / Build results requests": {
+      "main": [
+        [
+          {
+            "node": "Pobierz wyniki podobnych / Fetch similar results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pobierz wyniki podobnych / Fetch similar results": {
+      "main": [
+        [
+          {
+            "node": "Wybierz pojedyncze umowy / Keep single contracts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wybierz pojedyncze umowy / Keep single contracts": {
+      "main": [
+        [
+          {
+            "node": "Pobierz treści wyników / Fetch result notices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pobierz treści wyników / Fetch result notices": {
+      "main": [
+        [
+          {
+            "node": "Odczytaj ceny / Read prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Odczytaj ceny / Read prices": {
+      "main": [
+        [
+          {
+            "node": "Policz statystyki (Python) / Compute statistics (Python)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Policz statystyki (Python) / Compute statistics (Python)": {
+      "main": [
+        [
+          {
+            "node": "Zbierz dane dla AI / Gather data for AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zbierz dane dla AI / Gather data for AI": {
+      "main": [
+        [
+          {
+            "node": "Oceń przetarg (AI) / Assess the tender (AI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Oceń przetarg (AI) / Assess the tender (AI)": {
+      "main": [
+        [
+          {
+            "node": "Zbuduj kartę / Build card",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zbuduj kartę / Build card": {
+      "main": [
+        [
+          {
+            "node": "Odpowiedz kartą / Respond with card",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Obserwuj frazę / Watch a phrase (POST radar-watch)": {
+      "main": [
+        [
+          {
+            "node": "Sprawdź obserwację / Validate watch request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sprawdź obserwację / Validate watch request": {
+      "main": [
+        [
+          {
+            "node": "Czy obserwacja jest poprawna? / Is the watch request valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Czy obserwacja jest poprawna? / Is the watch request valid?": {
+      "main": [
+        [
+          {
+            "node": "Wczytaj obserwowane / Load watched phrases",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Odpowiedz błędem obserwacji / Respond with watch error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wczytaj obserwowane / Load watched phrases": {
+      "main": [
+        [
+          {
+            "node": "Zdecyduj / Decide",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zdecyduj / Decide": {
+      "main": [
+        [
+          {
+            "node": "Czy zapisać? / Should we save it?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Czy zapisać? / Should we save it?": {
+      "main": [
+        [
+          {
+            "node": "Zrozum frazę do obserwacji (AI) / Understand the watched phrase (AI)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Odpowiedz: już jest lub limit / Respond: exists or limit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zrozum frazę do obserwacji (AI) / Understand the watched phrase (AI)": {
+      "main": [
+        [
+          {
+            "node": "Przygotuj wpis / Prepare watch entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Przygotuj wpis / Prepare watch entry": {
+      "main": [
+        [
+          {
+            "node": "Zapisz obserwację / Save watch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zapisz obserwację / Save watch": {
+      "main": [
+        [
+          {
+            "node": "Odpowiedz: zapisano / Respond: saved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alerty co 2 godz. / Alerts every 2 hours": {
+      "main": [
+        [
+          {
+            "node": "Wczytaj aktywne frazy / Load active phrases",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wczytaj aktywne frazy / Load active phrases": {
+      "main": [
+        [
+          {
+            "node": "Zapytania dla fraz / Build alert requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zapytania dla fraz / Build alert requests": {
+      "main": [
+        [
+          {
+            "node": "Pobierz nowe z BZP / Fetch new from BZP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pobierz nowe z BZP / Fetch new from BZP": {
+      "main": [
+        [
+          {
+            "node": "Wczytaj dziennik alertów / Load alert log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wczytaj dziennik alertów / Load alert log": {
+      "main": [
+        [
+          {
+            "node": "Wybierz nowe ogłoszenia / Pick new notices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wybierz nowe ogłoszenia / Pick new notices": {
+      "main": [
+        [
+          {
+            "node": "Wyślij alert na Telegram / Send Telegram alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wyślij alert na Telegram / Send Telegram alert": {
+      "main": [
+        [
+          {
+            "node": "Wpisy do dziennika / Prepare log rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wpisy do dziennika / Prepare log rows": {
+      "main": [
+        [
+          {
+            "node": "Zapisz w dzienniku / Save to alert log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Kontrola źródeł codziennie / Daily source check": {
+      "main": [
+        [
+          {
+            "node": "Sprawdź BZP / Check BZP",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sprawdź BZP / Check BZP": {
+      "main": [
+        [
+          {
+            "node": "Sprawdź TED / Check TED",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sprawdź TED / Check TED": {
+      "main": [
+        [
+          {
+            "node": "Oceń stan źródeł / Evaluate source health",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Oceń stan źródeł / Evaluate source health": {
+      "main": [
+        [
+          {
+            "node": "Zapisz stan zdrowia / Save health state",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Czy jest problem? / Any problem?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Zapisz stan zdrowia / Save health state": {
+      "main": [
+        [
+          {
+            "node": "Wyczyść stary dziennik / Clean old alert log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Czy jest problem? / Any problem?": {
+      "main": [
+        [
+          {
+            "node": "Wyślij ostrzeżenie / Send warning",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Status źródeł / Sources status (GET radar-status)": {
+      "main": [
+        [
+          {
+            "node": "Wczytaj stan / Load health state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wczytaj stan / Load health state": {
+      "main": [
+        [
+          {
+            "node": "Przygotuj status / Build status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Przygotuj status / Build status": {
+      "main": [
+        [
+          {
+            "node": "Odpowiedz statusem / Respond with status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Strona wyszukiwarki / Search page (GET radar)": {
+      "main": [
+        [
+          {
+            "node": "Pliki strony / Page files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pliki strony / Page files": {
+      "main": [
+        [
+          {
+            "node": "Złóż stronę / Assemble page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Złóż stronę / Assemble page": {
+      "main": [
+        [
+          {
+            "node": "Odpowiedz stroną / Respond with page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": true,
+    "timezone": "Europe/Warsaw"
+  },
+  "nodeGroups": [
+    {
+      "id": "f7acdbf4-0083-470e-a64e-c503662b472f",
+      "name": "1 · Wyszukiwanie: wejście i zabezpieczenia / 1 · Search: input and safeguards",
+      "nodeNames": [
+        "Sprawdź zapytanie / Validate input",
+        "Czy fraza jest poprawna? / Is the phrase valid?",
+        "Odpowiedz błędem / Respond with error",
+        "Czy mamy wynik w pamięci? / Is it cached?"
+      ],
+      "description": "Sprawdza frazę, limit i pamięć podręczną. / Checks the phrase, the limit and the cache."
+    },
+    {
+      "id": "6b199a23-1c0d-4da4-bc62-825f5231401f",
+      "name": "1b · Wyszukiwanie: szybka odpowiedź z pamięci / 1b · Search: quick answer from cache",
+      "nodeNames": [
+        "Odpowiedz z pamięci / Respond from cache"
+      ],
+      "description": "Powtórzone wyszukiwanie wraca od razu. / A repeated search returns at once."
+    },
+    {
+      "id": "2a988495-7f3e-41d7-bec2-08f5a37e4ad2",
+      "name": "2 · Wyszukiwanie: rozumienie frazy (AI) / 2 · Search: understanding the phrase (AI)",
+      "nodeNames": [
+        "Zrozum frazę (AI) / Understand the phrase (AI)"
+      ],
+      "description": "AI zamienia zwykłe słowa na słowa kluczowe i kody branżowe. / AI turns plain words into keywords and industry codes."
+    },
+    {
+      "id": "177232eb-8608-42e0-8206-237e9333e5e0",
+      "name": "3 · Wyszukiwanie: BZP i TED na żywo / 3 · Search: BZP and TED live",
+      "nodeNames": [
+        "Przygotuj zapytania / Build source queries",
+        "Pobierz z BZP / Fetch from BZP",
+        "Pobierz z TED / Fetch from TED",
+        "Połącz źródła / Combine sources",
+        "Ujednolić i usuń duplikaty / Normalize & deduplicate"
+      ],
+      "description": "Pyta oficjalne źródła na żywo i łączy wyniki. / Asks the official sources live and joins the results."
+    },
+    {
+      "id": "d4c30f19-7ff5-490f-8676-03842f4b6142",
+      "name": "4 · Wyszukiwanie: ocena i odpowiedź (Python) / 4 · Search: scoring and answer (Python)",
+      "nodeNames": [
+        "Oceń trafność (Python) / Score relevance (Python)",
+        "Zbuduj odpowiedź / Build response",
+        "Odpowiedz wynikami / Respond with results"
+      ],
+      "description": "Ocenia trafność 0-100 i odsyła 12 najlepszych. / Scores relevance 0-100 and returns the best 12."
+    },
+    {
+      "id": "244b4d5d-5cc4-4ab7-9b67-e483ee017426",
+      "name": "5 · Karta przetargu: wejście i treść ogłoszenia / 5 · Tender card: input and notice text",
+      "nodeNames": [
+        "Sprawdź kartę / Validate card request",
+        "Czy dane karty są poprawne? / Is the card request valid?",
+        "Odpowiedz błędem karty / Respond with card error",
+        "Pobierz treść ogłoszenia / Fetch notice text",
+        "Wyciągnij dane z ogłoszenia / Extract notice facts"
+      ],
+      "description": "Czyści dane i pobiera ogłoszenie (opis, kryteria, wadium). / Cleans data and fetches the notice (description, criteria, deposit)."
+    },
+    {
+      "id": "63e3d91f-d6db-4edd-9520-2bf088f63ca4",
+      "name": "6 · Karta przetargu: ceny i konkurencja (Python) / 6 · Tender card: prices and competition (Python)",
+      "nodeNames": [
+        "Przygotuj zapytania o wyniki / Build results requests",
+        "Pobierz wyniki podobnych / Fetch similar results",
+        "Wybierz pojedyncze umowy / Keep single contracts",
+        "Pobierz treści wyników / Fetch result notices",
+        "Odczytaj ceny / Read prices",
+        "Policz statystyki (Python) / Compute statistics (Python)"
+      ],
+      "description": "Z podobnych rozstrzygniętych przetargów liczy ceny i konkurencję. / From similar decided tenders it works out prices and competition."
+    },
+    {
+      "id": "17bca72d-3749-432b-aad2-99af1eab683f",
+      "name": "7 · Karta przetargu: ocena AI i odpowiedź / 7 · Tender card: AI assessment and answer",
+      "nodeNames": [
+        "Zbierz dane dla AI / Gather data for AI",
+        "Oceń przetarg (AI) / Assess the tender (AI)",
+        "Zbuduj kartę / Build card",
+        "Odpowiedz kartą / Respond with card"
+      ],
+      "description": "AI ocenia przetarg po polsku i angielsku i odsyła kartę. / AI assesses the tender in Polish and English and returns the card."
+    },
+    {
+      "id": "479a0851-df5c-4ae8-8a52-1fb20ec22c15",
+      "name": "8 · Obserwowanie fraz / 8 · Watching phrases",
+      "nodeNames": [
+        "Sprawdź obserwację / Validate watch request",
+        "Czy obserwacja jest poprawna? / Is the watch request valid?",
+        "Odpowiedz błędem obserwacji / Respond with watch error",
+        "Wczytaj obserwowane / Load watched phrases",
+        "Zdecyduj / Decide",
+        "Czy zapisać? / Should we save it?",
+        "Odpowiedz: już jest lub limit / Respond: exists or limit",
+        "Zrozum frazę do obserwacji (AI) / Understand the watched phrase (AI)",
+        "Przygotuj wpis / Prepare watch entry",
+        "Zapisz obserwację / Save watch",
+        "Odpowiedz: zapisano / Respond: saved"
+      ],
+      "description": "Zapisuje frazę do obserwowania, bez duplikatów i z limitem. / Saves a phrase to watch, with no duplicates and with a limit."
+    },
+    {
+      "id": "f0bbb05e-e4e9-42a6-a65d-2442097479a9",
+      "name": "9 · Alerty na Telegramie / 9 · Telegram alerts",
+      "nodeNames": [
+        "Wczytaj aktywne frazy / Load active phrases",
+        "Zapytania dla fraz / Build alert requests",
+        "Pobierz nowe z BZP / Fetch new from BZP",
+        "Wczytaj dziennik alertów / Load alert log",
+        "Wybierz nowe ogłoszenia / Pick new notices",
+        "Wyślij alert na Telegram / Send Telegram alert",
+        "Wpisy do dziennika / Prepare log rows",
+        "Zapisz w dzienniku / Save to alert log"
+      ],
+      "description": "Co 2 godz. szuka nowych przetargów i wysyła alert bez powtórek. / Every 2 h it finds new tenders and sends an alert, no repeats."
+    },
+    {
+      "id": "6d3b74fe-5171-45cd-a266-4d3be881ab6c",
+      "name": "10 · Kontrola źródeł / 10 · Source watchdog",
+      "nodeNames": [
+        "Sprawdź BZP / Check BZP",
+        "Sprawdź TED / Check TED",
+        "Oceń stan źródeł / Evaluate source health",
+        "Zapisz stan zdrowia / Save health state",
+        "Wyczyść stary dziennik / Clean old alert log",
+        "Czy jest problem? / Any problem?",
+        "Wyślij ostrzeżenie / Send warning"
+      ],
+      "description": "Codziennie sprawdza BZP i TED i ostrzega na Telegramie. / Checks BZP and TED daily and warns on Telegram."
+    },
+    {
+      "id": "1a872063-3172-4b40-9489-21237894523d",
+      "name": "11 · Status źródeł dla strony / 11 · Sources status for the page",
+      "nodeNames": [
+        "Wczytaj stan / Load health state",
+        "Przygotuj status / Build status",
+        "Odpowiedz statusem / Respond with status"
+      ],
+      "description": "Daje stronie informację, czy źródła działają. / Tells the page whether the sources work."
+    },
+    {
+      "id": "5cfbbd2f-811f-4acb-a265-bab1765a877d",
+      "name": "12 · Strona wyszukiwarki / 12 · Search page",
+      "nodeNames": [
+        "Pliki strony / Page files",
+        "Złóż stronę / Assemble page",
+        "Odpowiedz stroną / Respond with page"
+      ],
+      "description": "Gotowa strona PL/EN pod jednym adresem. / A ready PL/EN page at one address."
+    }
+  ]
+}
